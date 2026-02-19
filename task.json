@@ -1,0 +1,16 @@
+{
+    "mission_id": "matrix_engine",
+    "mode": "continue",
+    "language": "rust",
+    "project_name": "matrix_engine",
+    "goal": "Implement a Rust CLI tool that evaluates N x N matrix expressions provided in Matlab-style syntax.",
+    "requirements": [
+        "PHASE 1 (CORE LIB): Create `src/matrix.rs`. Implement a Matrix struct that supports Addition (+), Multiplication (*), and Determinant (det). MUST include unit tests inside the module.",
+        "PHASE 2 (PARSER): Create `src/parser.rs`. Implement a function that parses Matlab-style strings (e.g., '[1,2;3,4]') into a Matrix struct. MUST include unit tests for valid and invalid inputs.",
+        "PHASE 3 (INTEGRATION): Update `src/main.rs`. It must import the `matrix` and `parser` modules. It should accept a single CLI argument (the expression), parse it, compute the result, and print it to stdout.",
+        "CONSTRAINT: The project is ALREADY initialized. Do NOT run `cargo new`. Modify existing files only.",
+        "CONSTRAINT: Tech Lead is restricted to code only. Do not ask them to change folder structures or git settings."
+    ],
+    "usage_example": "matrix_engine '[1,2;3,4] * [5,6;7,8]' or matrix_engine 'det([1,2,3;4,5,6;7,8,9])'",
+    "target": "rust"
+}

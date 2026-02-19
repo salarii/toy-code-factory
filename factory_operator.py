@@ -1,0 +1,1743 @@
+import re
+import json
+import asyncio
+from typing import Literal
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from functools import partial
+from langchain_core.messages import AIMessage
+from langchain_core.tools import tool
+from contract_integration import format_phase_as_implementation_guide
+import os
+
+_ACTIVE_SUBGRAPH = None
+
+# ============================================================================
+# PERSONA TEMPLATE RENDERING
+# ============================================================================
+
+
+
+_CONTRACT_MANAGER = None  # Global contract manager
+
+
+# Import everything from our new engine
+from contract_integration import (
+    initialize_contracts_for_run, ContractManager,
+    inject_contract_into_tech_lead_prompt, inject_architect_contract_awareness
+)
+
+from factory_engine import (MainState, CoderState, AgentContext, safe_model_call,log_split, log_input, init_input_log, 
+    log_terminal, log_file, log_transaction_start, log_transaction_end, 
+    log_input_messages, log_output_response,
+    prepare_workspace, load_task_config, load_persona_config, parse_agent_report
+)
+
+import datetime
+from pathlib import Path
+
+
+# ============================================================================
+# SPECIALIST INTERVENTION TRACKING
+# ============================================================================
+
+class InterventionTracker:
+    """
+    Tracks Specialist interventions to prevent infinite loops.
+    """
+    
+    def __init__(self, log_path: str):
+        self.log_path = Path(log_path)
+        self.interventions = {} 
+        self._load_log()
+    
+    def _load_log(self):
+        if self.log_path.exists():
+            try:
+                with open(self.log_path, 'r') as f:
+                    self.interventions = json.load(f)
+            except:
+                self.interventions = {}
+    
+    def _save_log(self):
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.log_path, 'w') as f:
+            json.dump(self.interventions, f, indent=2)
+    
+    def can_intervene(self, problem_id: str) -> tuple[bool, str]:
+        if problem_id not in self.interventions:
+            return True, "First attempt"
+        
+        history = self.interventions[problem_id]
+        if history["status"] == "fixed":
+            return False, f"HALT: Problem {problem_id} recurred after Specialist fix."
+        if history["status"] == "unfixable":
+            return False, f"HALT: Problem {problem_id} previously marked unfixable."
+        if history["attempts"] >= 1:
+            return False, f"HALT: Problem {problem_id} already attempted {history['attempts']} time(s)."
+        
+        return True, f"Retry allowed (previous attempts: {history['attempts']})"
+    
+    def log_intervention(self, problem_id: str, fix_type: str, status: str, changed_files: list, summary: str):
+        if problem_id not in self.interventions:
+            self.interventions[problem_id] = {"attempts": 0, "status": "pending", "history": []}
+        
+        self.interventions[problem_id]["attempts"] += 1
+        self.interventions[problem_id]["status"] = status
+        self.interventions[problem_id]["history"].append({
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "fix_type": fix_type,
+            "status": status,
+            "changed_files": changed_files,
+            "summary": summary
+        })
+        self._save_log()
+
+_INTERVENTION_TRACKER = None
+_SPECIALIST_SCOPED_PAYLOAD = None
+
+
+
+# ============================================================================
+# CONTROL TOOLS (The Router Intercepts These)
+# ============================================================================
+
+@tool
+def deploy_coder(task: str):
+    """Deploys the Junior Coder/Tech Lead team."""
+    # LOGGING ADDED: Logs exactly what the Architect sent
+    log_split(
+        f"--- [HANDOVER SEND] Architect >> Coder ---", 
+        f"PAYLOAD:\n{task}"
+    )
+    return "DEPLOYING_CODER"
+
+@tool
+def deploy_integrator(task: str):
+    """Deploys the Integrator."""
+    # LOGGING ADDED
+    log_split(
+        f"--- [HANDOVER SEND] Architect >> Integrator ---", 
+        f"PAYLOAD:\n{task}"
+    )
+    return "DEPLOYING_INTEGRATOR"
+
+@tool
+def deploy_specialist(task: str):
+    """Deploys the Specialist."""
+    # LOGGING ADDED
+    log_split(
+        f"--- [HANDOVER SEND] Architect >> Specialist ---", 
+        f"PAYLOAD:\n{task}"
+    )
+    return "DEPLOYING_SPECIALIST"
+
+
+@tool
+def mark_phase_done(phase_id: str):
+    """
+    Mark a development phase as DONE.
+    
+    Use when subordinate reports SUCCESS with proof:
+    - Tech Lead: Tests pass, code works
+    - Integrator: Phase goal achieved  
+    - Specialist: Fixed and working (even with workarounds)
+    
+    Trust subordinates. If they show proof, mark it done.
+    
+    Args:
+        phase_id: Phase identifier (e.g., "P001", "P002")
+    
+    Returns:
+        Confirmation message
+    """
+    global _CONTRACT_MANAGER
+    
+    if _CONTRACT_MANAGER is None:
+        return "ERROR: Contract manager not initialized"
+    
+    try:
+        _CONTRACT_MANAGER.update_phase_status(phase_id, "done")
+        return f"✓ Phase {phase_id} marked as DONE"
+    except ValueError as e:
+        return f"ERROR: {str(e)}"
+    except Exception as e:
+        return f"ERROR: Failed to mark phase - {str(e)}"
+
+@tool
+def list_phase_status():
+    """
+    Show which phases are marked DONE.
+    
+    Use before planning to see what's already completed.
+    
+    Returns:
+        Simple list showing DONE vs NOT DONE for each phase
+    """
+    global _CONTRACT_MANAGER
+    
+    if _CONTRACT_MANAGER is None:
+        return "ERROR: Contract manager not initialized"
+    
+    try:
+        plan_mgr = _CONTRACT_MANAGER.get_plan_manager()
+        all_statuses = plan_mgr.get_all_phase_statuses()
+        
+        lines = ["Phase Status:"]
+        for phase in plan_mgr.plan["phases"]:
+            phase_id = phase["phase_id"]
+            status = all_statuses.get(phase_id, "")
+            marker = "✓ DONE" if status == "done" else "○ NOT DONE"
+            lines.append(f"  {marker} - {phase_id}: {phase['phase_name']}")
+        
+        return "\n".join(lines)
+        
+    except Exception as e:
+        return f"ERROR: Failed to get status - {str(e)}"
+
+# Helper to extract payload safely
+def extract_mission_payload(last_message, tool_name_trigger):
+    """
+    Robustly extracts the 'task' argument from a tool call, handling:
+    1. Standard LangChain tool_calls (dictionary args)
+    2. Stringified JSON args (common LLM quirk)
+    3. Legacy 'function_call' in additional_kwargs (Gemini/OpenAI fallback)
+    4. Argument alias mismatches (task vs task_description)
+    """
+    payload = "No task provided."
+
+    # --- STRATEGY 1: Standard Tool Calls (Modern LangChain) ---
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == tool_name_trigger:
+                args = tool_call.get("args", {})
+                
+                # CRITICAL FIX: Sometimes args come as a JSON string, not a dict
+                if isinstance(args, str):
+                    try: args = json.loads(args)
+                    except: pass
+                
+                # Check likely keys
+                payload = args.get("task") or args.get("task_architect") or args.get("problem_description") or args.get("integration_goal")
+                if payload: return payload
+
+    # --- STRATEGY 2: specific fallback for Google/Gemini 'function_call' ---
+    # Sometimes logic bypasses tool_calls and sits in additional_kwargs
+    if hasattr(last_message, "additional_kwargs"):
+        func_call = last_message.additional_kwargs.get("function_call")
+        if func_call and func_call.get("name") == tool_name_trigger:
+            args_str = func_call.get("arguments", "{}")
+            try:
+                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                payload = args.get("task") or args.get("task_architect")
+                if payload: return payload
+            except: pass
+
+    # --- STRATEGY 3: Last Resort (Content) ---
+    # If the model refused to call the tool but wrote the text, grab the text.
+    if last_message.content and len(last_message.content) > 10:
+        return last_message.content
+
+    if not payload or not isinstance(payload, str) or not payload.strip():
+        return "Proceed with standard execution protocol: Build and Verify."
+        
+    return payload
+
+# ============================================================================
+# DECISION TRACKING
+# ============================================================================
+DECISION_COUNTER = {"count": 0}
+
+def get_decision_id(agent_prefix: str) -> str:
+    """Generate unique decision ID for tracking."""
+    DECISION_COUNTER["count"] += 1
+    return f"{agent_prefix}-{DECISION_COUNTER['count']:03d}"
+
+
+
+# ============================================================================
+# TOOL PERMISSION FILTERS
+# ============================================================================
+
+def get_architect_tools(tool_schemas):
+    """
+    Architect sees:
+    1. Delegation tools (Deploy Coder/Integrator) - To give orders.
+    2. Read-only tools (List/Read) - To VERIFY state before planning.
+    3. Phase marking tools - To mark what's done.
+    """
+    # 1. Select the specific delegation tools
+    delegation_names = {"deploy_coder", "deploy_integrator", "deploy_specialist", "update_ledger"}
+    
+    # 2. Select read-only tools (New Capability)
+    read_names = {"list_files"}  # PATCHED: Architect checks file existence only, never content
+    
+    # 3. Phase marking tools
+    phase_marking_names = {"mark_phase_done", "list_phase_status"}
+
+    selected = []
+    for t in tool_schemas:
+        if t["name"] in delegation_names or t["name"] in read_names or t["name"] in phase_marking_names:
+            selected.append(t)
+            
+    return selected
+
+def get_tech_lead_tools(tool_schemas):
+    """Tech Lead can ONLY read files and update scratchpad - NO WRITE ACCESS."""
+    allowed_mcp_tools = [
+        "list_files",
+        "read_file", 
+        "read_file_lines",
+        "get_workspace_info"
+    ]
+    
+    filtered = [
+        t for t in tool_schemas 
+        if t['name'] in allowed_mcp_tools
+    ]
+    
+    # Add control flow tools
+    filtered.extend([delegate_task, finish_task, update_scratchpad])
+    
+    return filtered
+
+def get_junior_dev_tools(tool_schemas):
+    """Junior has full code tools EXCEPT workspace initialization."""
+    forbidden = ["set_workspace_context"]  # Only operator can call this
+    
+    return [
+        t for t in tool_schemas 
+        if t['name'] not in forbidden
+    ]
+
+def get_specialist_tools(tool_schemas):
+    """Specialist has FULL ACCESS - emergency recovery mode."""
+    return tool_schemas  # All tools available
+
+def get_integrator_tools(tool_schemas):
+    """Integrator has code tools but NOT module implementation tools."""
+    allowed = [
+        "write_file",
+        "edit_file_replace", 
+        "run_command",
+        "git_checkpoint",
+        "list_files",
+        "read_file",
+        "read_file_lines",
+        "get_workspace_info"
+    ]
+    
+    return [
+        t for t in tool_schemas 
+        if t['name'] in allowed
+    ]
+
+# ============================================================================
+# CONTROL TOOLS
+# ============================================================================
+
+
+@tool
+def update_ledger(ledger_content: str = ""):
+    """[ARCHITECT ONLY] Update project ledger with completed milestones and technical debt."""
+    return "LEDGER_UPDATED"
+
+@tool
+def delegate_task(plan: str):
+    """[TECH LEAD ONLY] Send implementation plan to Junior Developer."""
+    return "DELEGATION_SENT"
+
+@tool
+def finish_task(summary: str):
+    """
+    [TECH LEAD ONLY] Mark current task as complete. 
+    GUIDANCE: If the task failed or is incomplete, use the structure:
+    <failure report> <I tried to achieve>...<but  there was a problem>...
+    """
+    return "TASK_COMPLETE"
+
+@tool
+def update_scratchpad(notes: str):
+    """[TECH LEAD ONLY] Update your memory/notes."""
+    return "SCRATCHPAD_UPDATED"
+
+# ============================================================================
+# LEAF AGENT NODES (Tech Lead + Junior Dev)
+# ============================================================================
+
+async def tech_lead_node(state: CoderState, model, personas, tool_schemas):
+    """
+    Tech Lead Node - PURE WORKER
+    - Logic stripped of global state dependencies.
+    - No resume logic (Architect handles that now).
+    - Focuses purely on session execution.
+    """
+    decision_id = get_decision_id("TL")
+    log_terminal(f"[{decision_id}] Tech Lead → Analyzing...")
+    
+    global _CONTRACT_MANAGER
+    task_description = state.get("techlead_context", {}).get("task_description") or "ask for more instruction situation unclear"
+    project_root = state.get("techlead_context", {}).get("project_root", "./")
+    current_notes = state.get("scratchpad", "")
+    
+    # Contract Injection (Optional)
+    current_phase_info_str = ""
+    if _CONTRACT_MANAGER:
+        current_phase_info_json = _CONTRACT_MANAGER.get_current_phase_info()
+        if current_phase_info_json:
+            current_phase_info_str = format_phase_as_implementation_guide(current_phase_info_json)
+
+    # --- CLEAN START (No DB checks here) ---
+    log_split(
+        f"[{decision_id}] Tech Lead Received Task", 
+        f"TASK_DESCRIPTION: {task_description}"
+    )
+
+    if current_notes:
+        current_notes = f"\n[SCRATCHPAD UPDATE]\n{current_notes}"
+    else:
+            current_notes = ""
+
+    # SESSION MEMORY: Tech Lead maintains memory WITHIN this session
+    messages = [task_description, current_phase_info_str + current_notes, project_root] + \
+          state.get("messages", [])
+    
+    # --- JUNIOR OUTPUT INTEGRATION ---
+    junior_return = state.get("junior_output")
+    if junior_return:
+        # 1. Add Junior's Report to history
+        messages.append(junior_return)
+        
+        # 2. Analyze Report
+        jr_content = str(junior_return.content).lower() if hasattr(junior_return, 'content') else str(junior_return).lower()
+        is_success = "status: success" in jr_content or "junior success report" in jr_content
+ 
+        if is_success:
+            # 3. Verify Physical Proof (Certificate)
+            cert_status = "⚠ Certificate missing on disk."
+            try:
+                import os
+                cert_path = os.path.join(project_root, "test_certificate.json")
+                if os.path.exists(cert_path):
+                    cert_status = f"✅ Test Certificate verified at: {cert_path}"
+            except Exception:
+                pass
+ 
+            # 4. Inject Review Protocol (Read-Only Guardrail)
+            review_protocol = HumanMessage(content=(
+                f"### 🛑 HANDOVER PROTOCOL: JUNIOR FINISHED ###\n"
+                f"Result: SUCCESS reported.\n"
+                f"Proof: {cert_status}\n\n"
+                f"**YOUR INSTRUCTIONS:**\n"
+                f"1. REVIEW the code changes using `read_file`.\n"
+                f"2. VERIFY the tests by reading `test_certificate.json`.\n"
+                f"3. DECIDE:\n"
+                f"   - **ACCEPT**: Call `finish_task(summary)`.\n"
+                f"   - **REJECT**: Call `delegate_task(instructions)` to send back to Junior.\n"
+                f"NOTE: You are now READ-ONLY. Do not edit files."
+            ))
+            messages.append(review_protocol)
+            log_terminal(f"[{decision_id}] 📋 Review Protocol Activated")
+        else:
+            # Junior Failed
+            messages.append(HumanMessage(content=(
+                "### ⚠ JUNIOR FAILED ###\n"
+                "The Junior Developer failed to complete the task within the iteration limit.\n"
+                "Review the error log above. You must RE-PLAN and call `delegate_task` with simpler or clearer instructions."
+           )))
+    # STRICT TOOL FILTERING
+    tech_lead_tools = get_tech_lead_tools(tool_schemas)
+
+    response = await safe_model_call(messages, model.bind_tools(tech_lead_tools), "Tech Lead", state)
+    
+
+    # MEMORY COMPRESSION (For Junior Delegation)
+    if hasattr(response, 'tool_calls') and any(tc['name'] == 'delegate_task' for tc in response.tool_calls):
+            log_terminal(f"[{decision_id}] 🧠 Compressing session memory for Junior delegation...")
+            internal_summary = await summarize_current_state_ucp(messages + [response], model)
+
+            new_session_messages = [
+                HumanMessage(content=f"### SESSION PROGRESS SUMMARY ###\n{internal_summary}"),
+                response
+            ]
+            # Extract the instructions from the tool call to pass to Junior
+            delegate_tc = next(tc for tc in response.tool_calls if tc['name'] == 'delegate_task')
+            junior_instructions = delegate_tc.get("args", {}).get("plan") or delegate_tc.get("args", {}).get("instructions") or delegate_tc.get("args", {}).get("task") or "Proceed with delegated task."
+
+            return {
+                "messages": new_session_messages,
+                "junior_context": {**state.get("junior_context", {}), "task_description": junior_instructions}
+            }
+
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        for tc in response.tool_calls:
+            log_terminal(f"[{decision_id}] Action: {tc['name']}")
+    
+    # Check if Tech Lead needs completion reminder
+    needs_finish_reminder = False
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        has_delegation = any(tc['name'] == 'delegate_task' for tc in response.tool_calls)
+        has_finish = any(tc['name'] == 'finish_task' for tc in response.tool_calls)
+     
+        if not has_delegation and not has_finish:
+            raw_content = response.content or ""
+            if isinstance(raw_content, list):
+                response_text = " ".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in raw_content
+                )
+            else:
+                response_text = str(raw_content)
+            if "complete" in response_text.lower() or "done" in response_text.lower():
+                needs_finish_reminder = True
+    
+    new_session_messages = list(messages) + [response]
+    
+
+    if not (hasattr(response, 'tool_calls') and response.tool_calls):
+        _resp_text = str(response.content) if hasattr(response, 'content') else ""
+        if "delegate_task" in _resp_text.lower() and ("plan" in _resp_text.lower() or "{" in _resp_text):
+            # Extract everything after "delegate_task" as the plan
+            import re as _re7
+            _plan_match = _re7.search(r'delegate_task\W*\w*\W*(.+)', _resp_text, _re7.DOTALL | _re7.IGNORECASE)
+            if _plan_match:
+                _extracted_plan = _plan_match.group(1).strip().rstrip('}').strip()
+                if len(_extracted_plan) > 50:  # Only if substantial
+                    log_terminal(f"[{decision_id}] ⚠ Extracted text-embedded plan ({len(_extracted_plan)} chars)")
+                    return {
+                        "messages": new_session_messages, 
+                        "junior_context": {**state.get("junior_context", {}), "task_description": _extracted_plan}
+                        }
+
+
+    if needs_finish_reminder:
+        reminder = HumanMessage(content=(
+            "[SYSTEM REMINDER]\n"
+            "If all contract functions are implemented and tested, call finish_task(summary).\n"
+            "This reports completion to the Architect.\n"
+        ))
+        new_session_messages.append(reminder)
+        log_terminal(f"[{decision_id}] 💡 Adding finish_task reminder")
+     
+    return {"messages": new_session_messages}
+
+async def compress_junior_context_ucp(modified_files: list, original_task: str, iteration_count: int, last_error: str, junior_journal: str, model) -> str:
+    """
+    UCP-MSP compliant version of compress_junior_context.
+    
+    This version ONLY compresses execution details, not task/constraints.
+    The caller is responsible for re-injecting persona and task context.
+    """
+    # Build execution log summary (actions only, not identity)
+    execution_summary = f"""FILES MODIFIED:
+{', '.join(f or "" for f in modified_files) if modified_files else 'None'}
+
+COMPILATION ATTEMPTS: {iteration_count}/5
+
+JUNIOR EXECUTION JOURNAL:
+{junior_journal}
+
+LAST ERROR (truncated):
+{last_error[:500] if last_error else 'No error details available'}"""
+    
+    # API-compliant payload (FIX: SystemMessage + HumanMessage)
+    instructions = SystemMessage(content=(
+        "You are compressing a Junior Developer's execution log for handoff. "
+        "Create a BRIEF summary (max 200 words) covering:\n"
+        "1. What implementation approach was attempted\n"
+        "2. Which files were modified and why\n"
+        "3. What specifically failed in the last build/test\n"
+        "4. Recommendation for next step\n"
+        "Focus ONLY on actions taken, not the agent's identity or constraints."
+    ))
+    
+    payload = HumanMessage(content=f"""ORIGINAL TASK:
+{original_task}
+
+EXECUTION LOG:
+{execution_summary}
+
+Provide ONLY the summary text.""")
+    
+    response = await model.ainvoke([instructions, payload])
+    return response.content
+
+
+async def compress_junior_session_ucp(messages: list, action_type: str, affected_files: list, model) -> str:
+    """
+    UCP-MSP compliant version of compress_junior_session.
+    
+    Compresses Junior Dev's session memory after file operations.
+    ONLY compresses the conversation log, not persona or task.
+    """
+    # Extract last 5 messages for context (execution only)
+    recent_messages = messages[-5:] if len(messages) > 5 else messages
+    log_text = "\n".join([
+        f"{msg.__class__.__name__}: {msg.content if hasattr(msg, 'content') else str(msg)}"
+        for msg in recent_messages
+    ])
+    
+    # API-compliant payload (FIX: SystemMessage + HumanMessage)
+    instructions = SystemMessage(content=(
+        "You are compressing a Junior Developer's work session after a file modification. "
+        "Create a BRIEF summary (max 150 words) covering:\n"
+        "1. What problem was being solved\n"
+        "2. What approach was decided\n"
+        "3. Why this specific file operation was committed\n"
+        "4. Expected outcome\n"
+        "Focus on DECISIONS MADE, not the thinking process or agent identity."
+    ))
+    
+    payload = HumanMessage(content=f"""ACTION COMMITTED: {action_type}
+FILES AFFECTED: {', '.join(affected_files) if affected_files else 'Unknown'}
+
+Session history (last 5 messages):
+{log_text}
+
+Provide ONLY the summary text.""")
+    
+    try:
+        response = await model.ainvoke([instructions, payload])
+        return response.content
+    except Exception as e:
+        return f"[Compression failed: {str(e)}] Action: {action_type} on {affected_files}"
+
+async def junior_dev_node(state: CoderState, model, session: ClientSession, personas, tool_schemas):
+    """
+    Junior Dev Node - NESTED SESSION MEMORY
+    - Receives task from Tech Lead
+    - Operates within Tech Lead's session scope
+    - Accumulates memory during execution
+    - Returns results to Tech Lead (who retains memory)
+    """
+    decision_id = get_decision_id("JR")
+    log_terminal(f"[{decision_id}] Junior Dev → Implementing...")
+    
+
+    junior_ctx = state.get("junior_context", {})
+    techlead_ctx = state.get("techlead_context", {})
+
+    task_description = junior_ctx.get("task_description") 
+    project_root = junior_ctx.get("project_root") or techlead_ctx.get("project_root") or "."
+    base_dir = junior_ctx.get("base_dir") or techlead_ctx.get("base_dir") or "."
+
+    modified_files = []
+    test_iteration = 0
+    MAX_TEST_ITERATIONS = 10
+    build_success = False
+    last_test_output = "" 
+    build_passed = False  
+    last_error = ""
+
+    log_split(
+        f"[{decision_id}] Junior Dev Received Task", 
+        f"TASK_DESCRIPTION: {task_description}"
+    )
+    
+    # Junior gets FULL code tools
+    junior_tools = get_junior_dev_tools(tool_schemas)
+    
+    # Prepend Contextual Headers to the Task
+    context_header = (
+        f"## ENVIRONMENT CONTEXT ##\n"
+        f"PROJECT_ROOT: {project_root}\n"
+        f"WORKING_DIR: {base_dir}\n"
+        f"-------------------------\n"
+    )
+    current_session_messages =[]
+
+    current_session_messages.append(
+        HumanMessage(content=f"{context_header}\nExecute this plan:\n{task_description}") 
+   )
+
+    while test_iteration < MAX_TEST_ITERATIONS and not build_success:
+        test_iteration += 1
+        log_terminal(f"[{decision_id}] Attempt {test_iteration}/{MAX_TEST_ITERATIONS}")
+        
+        cleaned_messages = []
+        for m in current_session_messages:
+            if hasattr(m, "tool_calls") and m.tool_calls:
+                call_strs = [f"Call Tool: {tc['name']} with {tc['args']}" for tc in m.tool_calls]
+                new_content = f"{m.content or ''}\n" + "\n".join(call_strs)
+                cleaned_messages.append(AIMessage(content=new_content))
+            else:
+                cleaned_messages.append(m)
+        
+        if cleaned_messages and isinstance(cleaned_messages[-1], AIMessage):
+             cleaned_messages.append(HumanMessage(content=f"Continue implementation or fix errors: {last_error}"))
+
+        response = await safe_model_call(cleaned_messages, model.bind_tools(junior_tools), "Junior Dev", state)
+        
+        tool_feedback = []
+        if response.tool_calls:
+            for tc in response.tool_calls:
+                try:
+                    res = await session.call_tool(tc["name"], arguments=tc["args"])
+                    output = res.content[0].text if res.content else "Done"
+                    tool_feedback.append(f"Tool '{tc['name']}' Output: {output}")
+
+                    # 2. Track modified files
+                    if tc['name'] in ['write_file', 'edit_file', 'edit_file_replace']:
+                        affected_file = tc['args'].get('filename') or tc['args'].get('path') or 'unknown'
+                        modified_files.append(affected_file)
+
+                    file_modification_actions = ['write_file', 'edit_file_replace']
+                    if tc['name'] in file_modification_actions:
+                        log_terminal(f"[{decision_id}] 🧠 Junior committed to file operation - compressing memory...")
+                        
+                        # Reset iteration counter on productive work
+                        if test_iteration > 0:
+                            log_terminal(f"[{decision_id}] ✓ Productive work detected - resetting iteration counter (was: {test_iteration})")
+                            test_iteration = 0
+                        
+                        try:
+                            compression_summary = await compress_junior_session_ucp(
+                                messages=current_session_messages,
+                                action_type=tc['name'],
+                                affected_files=[affected_file] if 'affected_file' in locals() else [],
+                                model=model
+                            )
+                            
+                            # Update session with compressed history
+                            current_session_messages = [
+                                HumanMessage(content=f"{context_header}\nExecute this plan:\n{task_description}"),
+                                HumanMessage(content=f"### WORK SUMMARY ###\n{compression_summary}"),
+                                response  # Current decision
+                            ]
+                            log_terminal(f"[{decision_id}] ✓ Memory compressed")
+                        except Exception as compress_err:
+                            log_terminal(f"[{decision_id}] ⚠ Compression failed: {compress_err}")
+
+                    if tc['name'] == 'run_command':
+                        cmd = tc['args'].get('command', '').lower()
+                        cmd_succeeded = "Exit Code: 0" in output
+                        
+                        if 'cargo test' in cmd:
+                            if cmd_succeeded:
+                                build_success = True  # Tests pass — we're done
+                                last_test_output = output 
+                                build_passed = True
+                                log_terminal(f"[{decision_id}] ✅ cargo test PASSED — marking success")
+                                # PATCHED v5: Write test certificate to filesystem
+                                try:
+                                    import json as _json5
+                                    cert_data = {
+                                        "status": "PASS",
+                                        "test_output": output[:2000],
+                                        "timestamp": __import__('datetime').datetime.utcnow().isoformat() + "Z",
+                                        "files_modified": list(set(modified_files)),
+                                        "task": task_description[:500]
+                                    }
+                                    cert_result = await session.call_tool(
+                                        "write_test_certificate",
+                                        arguments={"certificate_json": _json5.dumps(cert_data)}
+                                    )
+                                    log_terminal(f"[{decision_id}] 📜 Test certificate written to filesystem")
+                                except Exception as cert_err:
+                                    log_terminal(f"[{decision_id}] ⚠ Certificate write failed: {cert_err}")
+                            else:
+                                last_error = output
+                        elif 'cargo build' in cmd or 'cargo check' in cmd:
+                            if cmd_succeeded:
+                                build_passed = True   # Build OK but tests still needed
+                            else:
+                                last_error = output
+
+                except Exception as e:
+                    tool_feedback.append(f"Tool '{tc['name']}' Failed: {str(e)}")
+                    log_terminal(f"[{decision_id}] ❌ Tool Execution Error: {e}")
+
+        feedback_str = "\n".join(tool_feedback)
+        if build_passed and not build_success:
+            feedback_str += "\n\n[SYSTEM: Build compiled successfully. Now run 'cargo test' to verify correctness before reporting.]"
+        current_session_messages.extend([HumanMessage(content=f"Feedback: {feedback_str}")])
+
+    # Final reporting logic
+    if not build_success:
+
+        junior_journal = "No journal recorded."
+        for msg in reversed(current_session_messages):
+            if hasattr(msg, 'content') and "### WORK SUMMARY ###" in str(msg.content):
+                junior_journal = str(msg.content).split("### WORK SUMMARY ###")[-1].strip()
+                break
+
+        summary = await compress_junior_context_ucp(list(set(modified_files)), task_description, test_iteration, last_error, junior_journal, model)
+        
+        junior_report = HumanMessage(content=(
+            f"Junior Failure Report (Compressed):\n{summary}\n\n"
+            f"--- [JUNIOR EXECUTION JOURNAL] ---\n{junior_journal}\n\n"
+            f"Last Error Snapshot:\n{last_error}"
+        ))
+    
+    else:
+        test_proof = last_test_output[:500] if last_test_output else "No test output captured"
+        junior_report = HumanMessage(content=(
+            f"Junior Success Report:\n"
+            f"STATUS: SUCCESS\n"
+            f"Files modified: {', '.join(set(modified_files))}\n"
+            f"CARGO TEST OUTPUT:\n{test_proof}"
+        ))
+    
+    return {"junior_messages": current_session_messages , "junior_output" : junior_report}
+
+# ============================================================================
+# INTERNAL MEMORY COMPRESSION
+# ============================================================================
+
+async def summarize_current_state_ucp(messages: list, model) -> str:
+    """
+    UCP-MSP compliant version for Architect memory compression.
+    
+    [INTERNAL ONLY] Compresses Architect's memory into a Save Point.
+    ONLY compresses execution history, not persona or task definition.
+    """
+    # Convert messages to log format (execution only)
+    log_text = "\n".join([
+        f"{msg.__class__.__name__}: {msg.content if hasattr(msg, 'content') else str(msg)}"
+        for msg in messages
+    ])
+    
+    # API-compliant payload (FIX: SystemMessage + HumanMessage)
+    instructions = SystemMessage(content=(
+        "Analyze the project history. Create a dense 'Internal Status Report' for the Architect. "
+        "Summarize: 1. Final Project Goal 2. Completed Milestones 3. Current Logic State 4. Known Issues. "
+        "This is for internal grounding. Be technical and objective. "
+        "Focus on PROGRESS and STATE, not agent identity."
+    ))
+    
+    payload = HumanMessage(content=f"Synthesize current state from history:\n\n{log_text}")
+    
+    response = await model.ainvoke([instructions, payload])
+    return response.content
+
+
+# ============================================================================
+# MAIN AGENT NODES (Architect, Specialist, Integrator)
+# ============================================================================
+
+async def architect_node(state: MainState, model, personas, tool_schemas, control_tools=None):
+    """
+    Architect Node - Main orchestration logic
+    """
+    
+    decision_id = get_decision_id("AR")
+    log_terminal(f"[{decision_id}] Architect → Planning...")
+
+    current_ledger = state.get("project_ledger", "NO LEDGER YET")
+
+    trigger = "STOP: WRONG INSTRUCTION. ESCALATE FOR CLARIFICATION WITH SUPERIOR NOW."
+    
+    _arch_task = state.get("architect_context", {}).get("task_description", trigger)
+    messages = [HumanMessage(content=_arch_task)] + list(state.get("messages", []))
+            
+    error_output = "CRITICAL: Program operator needs to intervene."
+
+    # 3. Logic to crash the application
+    if trigger in messages:
+        # This prints the message to stderr and exits with a non-zero status code
+        raise SystemExit(error_output)
+
+    # Inject Ledger Context if available
+    if current_ledger and current_ledger != "NO LEDGER YET":
+        ledger_context = HumanMessage(content=f"[SYSTEM CONTEXT - Current Ledger]\n{current_ledger}")
+        messages.append(ledger_context)
+    
+    architect_tools = get_architect_tools(tool_schemas)
+    if control_tools:
+        architect_tools = architect_tools + list(control_tools)
+    
+    # PHASE COMPLETION — deterministic, no LLM verification of code
+    if len(messages) > 1:
+        last_msg = messages[-1]
+        if isinstance(last_msg, HumanMessage):
+            content_lower = last_msg.content.lower()
+
+            is_success = (
+                ("coding team report" in content_lower or
+                 "integrator report" in content_lower or
+                 "specialist report" in content_lower) and
+                ("status: success" in content_lower)
+            )
+            is_specialist_done = (
+                "specialist report" in content_lower and
+                ("status: success" in content_lower or "fixed" in content_lower)
+            )
+
+            if is_success or is_specialist_done:
+                # Determine current phase
+                phase_id = "UNKNOWN"
+                expected_files = []
+                if _CONTRACT_MANAGER:
+                    try:
+                        cpi = _CONTRACT_MANAGER.get_current_phase_info()
+                        if cpi:
+                            phase_id = cpi["phase"]["phase_id"]
+                            contract = cpi.get("contract", {}) or {}
+                            for tc in contract.get("contracts", []):
+                                fp = tc.get("module_spec", {}).get("file_path")
+                                if fp:
+                                    expected_files.append(fp)
+                    except Exception:
+                        pass
+
+                file_list = ", ".join(expected_files) if expected_files else "(check contract)"
+                reminder = HumanMessage(content=(
+                    f"[SYSTEM: PHASE COMPLETION — ACTION REQUIRED]\n"
+                    f"Subordinate reported SUCCESS for phase {phase_id}.\n"
+                    f"Expected files: {file_list}\n"
+                    f"You may call list_files to confirm file EXISTENCE only.\n"
+                    f"Then call mark_phase_done('{phase_id}') and deploy next phase.\n"
+                    f"DO NOT read file contents. Trust subordinate test results.\n"
+                ))
+                messages.append(reminder)
+                log_terminal(f"[{decision_id}] ✓ Phase completion signal — injecting mark_phase_done instruction")
+    
+    # CALL LLM
+    response = await safe_model_call(messages, model.bind_tools(architect_tools), "architect", state)
+  
+
+    # --- 5. POST-PROCESSING (Delegation logic) ------------------------------
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        for tc in response.tool_calls:
+            
+            if tc['name'].startswith("deploy_"):
+                target_agent = tc['name'].replace("deploy_", "").upper()
+                log_terminal(f"[{decision_id}] 🧠 Compressing internal memory for {target_agent} deployment...")
+                
+                internal_summary = await summarize_current_state_ucp(messages + [response], model)
+                
+                updated_task_desc = tc['args'].get('task') or tc['args'].get('task_description') or \
+                                   tc['args'].get('problem_description') or tc['args'].get('integration_goal') or "Execute."
+                compressed_messages = [
+                    HumanMessage(content=f"### INTERNAL STATE SUMMARY ###\n{internal_summary}"),
+                    response
+                ]
+
+                log_split(f"[{decision_id}] Architect Internal Save Point", internal_summary)
+                return {
+                    "messages": compressed_messages,
+                    "architect_context": {**state.get("architect_context", {}), "task_description": updated_task_desc}
+                }
+
+            if tc['name'] == 'update_ledger':
+                new_ledger = tc['args'].get('ledger_content', '')
+                return {"project_ledger": new_ledger, "messages": messages + [response]}
+
+    # PATCHED: Track text-only iterations — circuit breaker for self-loop
+    MAX_ARCHITECT_TEXT_ONLY = 3
+    if not (hasattr(response, "tool_calls") and response.tool_calls):
+        arch_count = state.get("architect_text_only_count", 0) + 1
+        if arch_count >= MAX_ARCHITECT_TEXT_ONLY:
+            force_msg = HumanMessage(content=(
+                "[SYSTEM: DECISION REQUIRED — LOOP DETECTED]\n"
+                f"You have produced {MAX_ARCHITECT_TEXT_ONLY} consecutive responses without calling any tool.\n"
+                "You MUST now call ONE of:\n"
+                "  - deploy_coder(task) / deploy_integrator(task) / deploy_specialist(task)\n"
+                "  - mark_phase_done(phase_id)\n"
+                "  - list_phase_status()\n"
+                "  - Output the word FINISHED if all phases are complete\n"
+                "Do NOT analyze further. ACT NOW.\n"
+            ))
+            log_terminal(f"[{decision_id}] ⚠ Architect text-only cap hit ({arch_count}) — forcing decision")
+            return {"messages": messages + [response, force_msg], "architect_text_only_count": arch_count}
+        return {"messages": messages + [response], "architect_text_only_count": arch_count}
+    return {"messages": messages + [response], "architect_text_only_count": 0}
+
+async def main_tools_node(state: MainState, session: ClientSession):
+    """
+    Executes tools for Architect (read-only operations)
+    Appends results to Architect's PERMANENT memory
+    """
+    decision_id = get_decision_id("MT")
+    last_msg = state["messages"][-1]
+    tool_feedback = []
+    
+    # PATCHED: Control tools execute locally, MCP tools go to server
+    CONTROL_TOOL_MAP = {
+        "mark_phase_done": lambda args: mark_phase_done.invoke(args),
+        "list_phase_status": lambda args: list_phase_status.invoke({}),
+    }
+
+    if hasattr(last_msg, "tool_calls"):
+        for tc in last_msg.tool_calls:
+            log_terminal(f"[{decision_id}] Tool: {tc['name']}")
+            try:
+                if tc["name"] in CONTROL_TOOL_MAP:
+                    # Execute locally — these are LangChain @tool, not MCP
+                    output = str(CONTROL_TOOL_MAP[tc["name"]](tc.get("args", {})))
+                else:
+                    # Execute via MCP server
+                    res = await session.call_tool(tc["name"], arguments=tc["args"])
+                    output = res.content[0].text if res.content else "Done"
+                
+                # File log: Full output
+                log_split(f"[{decision_id}] Tool Output: {tc['name']}", output)
+                
+                # Console: Summary
+                log_terminal(f"[{decision_id}] Result: {'✓' if 'Error' not in output else '✗'}")
+                
+                tool_feedback.append(f"Tool '{tc['name']}' Output: {output}")
+            except Exception as e:
+                log_terminal(f"[{decision_id}] Result: ✗ FAILED - {str(e)}")
+                tool_feedback.append(f"Tool '{tc['name']}' Failed: {str(e)}")
+
+    feedback_str = "\n".join(tool_feedback)
+    
+    # PERMANENT MEMORY: Append to Architect's history
+    current_messages = state.get("messages", [])
+    new_messages = list(current_messages) + [HumanMessage(content=feedback_str)]
+    
+    return {"messages": new_messages}
+
+# ============================================================================
+# LEAF WORKFLOW ROUTING (Tech Lead <-> Junior)
+# ============================================================================
+
+async def leaf_tools_node(state: CoderState, session: ClientSession):
+    """
+    Executes tools for Tech Lead
+    Returns results to Tech Lead's SESSION memory
+    
+    PATCHED: Enforces tool whitelist at execution time.
+    Tech Lead can only execute read-only MCP tools here.
+    Write/execute tools are BLOCKED even if the LLM requests them.
+    """
+    decision_id = get_decision_id("LT")
+    last_msg = state["messages"][-1]
+    tool_results = []
+    
+    # PATCHED: Hard whitelist — must match get_tech_lead_tools() MCP subset
+    TECH_LEAD_ALLOWED_MCP = {"list_files", "read_file", "read_file_lines", "get_workspace_info"}
+    
+    if hasattr(last_msg, "tool_calls"):
+        for tc in last_msg.tool_calls:
+            if tc["name"] in ["update_scratchpad"]:
+                log_terminal(f"[{decision_id}] Memory: scratchpad updated")
+                return {"scratchpad": tc["args"].get("notes", "")}
+            
+            # PATCHED: Block tools not in Tech Lead's allowed set
+            if tc["name"] not in TECH_LEAD_ALLOWED_MCP:
+                log_terminal(f"[{decision_id}] ⛔ BLOCKED: {tc['name']} (not in Tech Lead whitelist)")
+                # PATCHED v6: Context-aware block message
+                _jr_succeeded = any(
+                    "junior success report" in str(getattr(m, 'content', '')).lower()
+                    or ("status: success" in str(getattr(m, 'content', '')).lower()
+                        and "junior" in str(getattr(m, 'content', '')).lower())
+                    for m in current_messages[-5:] if hasattr(m, 'content')
+                )
+                if _jr_succeeded:
+                    tool_results.append(
+                        f"[{tc['name']}]: ❌ PERMISSION DENIED — Tech Lead is READ-ONLY.\n"
+                        f"Junior already reported SUCCESS with passing tests.\n"
+                        f"REVIEW_THEN_DECIDE:\n"
+                        f"  → If tests passed and code is acceptable: call finish_task(summary) to vouch for SUCCESS\n"
+                        f"  → If you found a critical flaw: call delegate_task(plan) with specific fix for Junior\n"
+                        f"  You CANNOT fix code yourself. Choose one of the above NOW."
+                    )
+                else:
+                    tool_results.append(
+                        f"[{tc['name']}]: ❌ PERMISSION DENIED — Tech Lead is READ-ONLY.\n"
+                        f"To modify code: call delegate_task(plan) with a precise fix plan for Junior Dev."
+                    )
+                continue
+            
+            log_terminal(f"[{decision_id}] Leaf Tool: {tc['name']}")
+            res = await session.call_tool(tc["name"], arguments=tc["args"])
+            output = res.content[0].text if res.content else "Done"
+            tool_results.append(f"[{tc['name']}]: {output}")
+    
+    # SESSION MEMORY: Append tool results to Tech Lead's session
+    current_messages = state.get("messages", [])
+    
+    # PATCHED v6: Track blocked writes → escalating decision pressure
+    _blocked_write_count = sum(1 for r in tool_results if "PERMISSION DENIED" in r)
+    if _blocked_write_count > 0:
+        _total_blocks = sum(
+            1 for m in current_messages
+            if hasattr(m, 'content') and "PERMISSION DENIED" in str(m.content)
+        ) + _blocked_write_count
+        
+        if _total_blocks >= 2:
+            tool_results.append(
+                "\n[SYSTEM: WRITE BLOCKED TWICE — DECISION REQUIRED]\n"
+                "You have attempted to modify files multiple times. "
+                "Tech Lead is READ-ONLY by design — this will never succeed.\n"
+                "You MUST now call ONE of:\n"
+                "  → finish_task(summary) — if tests passed, vouch for success to Architect\n"
+                "  → delegate_task(plan) — if code needs fixing, send fix plan to Junior\n"
+                "Do NOT attempt to write/edit files again."
+            )
+            log_terminal(f"[{decision_id}] 🚫 Write blocked {_total_blocks}x — forcing decision")
+    
+    new_messages = list(current_messages) + [HumanMessage(content="\n".join(tool_results))]
+    
+    return {"messages": new_messages}
+
+
+MAX_TECH_LEAD_TEXT_ONLY = 3
+
+async def leaf_nudge_node(state: CoderState, **kwargs):
+    """
+    Nudge node: increments text_only_count and injects a reminder message.
+    Routes back to tech_lead for another attempt.
+    """
+    current_count = state.get("text_only_count", 0) + 1
+    nudge = HumanMessage(content=(
+        "[SYSTEM: ACTION REQUIRED]\n"
+        "You responded without calling any tool. You MUST use one of:\n"
+        "  - delegate_task(plan) — to send work to Junior Dev\n"
+        "  - finish_task(summary) — to report completion to Architect\n"
+        "  - list_files / read_file / get_workspace_info — to gather information\n"
+        "  - update_scratchpad(notes) — to update your working memory\n"
+        f"Text-only responses remaining before forced exit: {MAX_TECH_LEAD_TEXT_ONLY - current_count}\n"
+    ))
+    current_messages = list(state.get("messages", []))
+    current_messages.append(nudge)
+    return {"messages": current_messages, "text_only_count": current_count}
+
+
+MAX_TECH_LEAD_TEXT_ONLY = 3
+
+def leaf_router(state: CoderState):
+    """
+    Routes Tech Lead decisions to Junior, Tools, or Finish.
+    PATCHED v2: Detects text-embedded tool calls from malformed LLM output.
+    Some models (Gemini) emit tool calls as text like "call:delegate_task{plan:...}"
+    instead of structured tool_calls. We detect and route these correctly.
+    """
+    last_msg = state["messages"][-1]
+    
+    # Tool calls: route normally and reset text_only counter
+    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+        for tc in last_msg.tool_calls:
+            if tc["name"] == "delegate_task":
+                return "junior_dev"
+            elif tc["name"] == "finish_task":
+                return "leaf_finish"
+            elif tc["name"] == "update_scratchpad":
+                return "leaf_tools"
+        return "leaf_tools"
+    
+    # PATCHED v2: Detect text-embedded tool calls (malformed LLM output)
+    # Some models output "call:delegate_task{plan:" or "delegate_task(" as text
+    msg_content = ""
+    if hasattr(last_msg, "content") and last_msg.content:
+        msg_content = str(last_msg.content) if not isinstance(last_msg.content, str) else last_msg.content
+
+    if msg_content:
+        content_lower = msg_content.lower()
+        if "delegate_task" in content_lower and ("plan" in content_lower or "{" in msg_content):
+            log_terminal(f"[LEAF-ROUTER] ⚠ Detected text-embedded delegate_task — routing to junior_dev")
+            return "junior_dev"
+        if "finish_task" in content_lower and ("summary" in content_lower or "{" in msg_content):
+            log_terminal(f"[LEAF-ROUTER] ⚠ Detected text-embedded finish_task — routing to leaf_finish")
+            return "leaf_finish"
+    
+    # No tool call: check text-only counter
+    text_only_count = state.get("text_only_count", 0)
+    if text_only_count >= MAX_TECH_LEAD_TEXT_ONLY:
+        log_terminal(f"[LEAF-ROUTER] Tech Lead hit {MAX_TECH_LEAD_TEXT_ONLY} text-only responses — forcing exit")
+        return "leaf_finish"
+    
+    # Under limit: nudge back to tech_lead via leaf_tools (will inject nudge message)
+    log_terminal(f"[LEAF-ROUTER] Tech Lead text-only response ({text_only_count + 1}/{MAX_TECH_LEAD_TEXT_ONLY}) — nudging")
+    return "leaf_nudge"
+
+def main_router(state: MainState):
+    """
+    The Smart Router (Interceptor Pattern).
+    Distinguishes between 'doing work' (File I/O) and 'managing people' (Deploying Agents).
+    """
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    # 1. Check for Tool Calls
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        # We iterate through calls to see if a CONTROL tool was used
+        for tool_call in last_message.tool_calls:
+            name = tool_call["name"]
+            
+            if name == "deploy_coder":
+                return "enter_leaf"
+            
+            if name == "deploy_integrator":
+                return "enter_integrator"
+            
+            if name == "deploy_specialist":
+                return "enter_expert"
+                
+        # If no control tool was found, but other tools exist (like read_file),
+        # route to the generic tool executor.
+        return "main_tools"
+
+    # 2. Check for Text Termination (Fallback)
+    if "FINISHED" in last_message.content:
+        return "__end__"
+    
+    # 3. Default: Return to Architect for more thinking
+    return "agent"
+
+# ============================================================================
+# FINAL STATUS REPORT
+# ============================================================================
+
+async def print_final_status(session: ClientSession, workspace_paths: dict):
+    """Print final build status and file locations (TERMINAL ONLY)."""
+    log_terminal("\n" + "="*70)
+    log_terminal("FACTORY RUN COMPLETE - FINAL STATUS")
+    log_terminal("="*70)
+    
+    try:
+        # Check project structure
+        files_result = await session.call_tool("list_files", arguments={"path": "."})
+        files_output = files_result.content[0].text if files_result.content else ""
+        
+        log_terminal("\n📁 PROJECT ROOT FILES:")
+        log_terminal(files_output)
+        
+        # Check for binary
+        binary_check = await session.call_tool(
+            "run_command", 
+            arguments={"command": "ls -lh target/release/ 2>/dev/null || echo 'No release binary found'"}
+        )
+        binary_output = binary_check.content[0].text if binary_check.content else ""
+        
+        log_terminal("\n🔨 BUILD ARTIFACTS:")
+        log_terminal(binary_output)
+        
+        # Final verdict
+        if "Exit Code: 0" in binary_output and "release" in binary_output:
+            log_terminal("\n✅ SUCCESS: Binary built successfully")
+            log_terminal(f"📍 Location: {workspace_paths['project_root']}/target/release/")
+        elif os.path.exists(os.path.join(workspace_paths['project_root'], "src")):
+            log_terminal("\n⚠️  PARTIAL: Source code present, build incomplete")
+        else:
+            log_terminal("\n❌ FAILURE: No artifacts generated")
+        
+    except Exception as e:
+        log_terminal(f"\n❌ Status check failed: {e}")
+    
+    log_terminal("="*70)
+    log_terminal(f"📂 Workspace: {workspace_paths['base_dir']}")
+    log_terminal(f"📄 Full log: {workspace_paths['run_dir']}/input_log.txt")
+    log_terminal("="*70 + "\n")
+
+# ============================================================================
+# WRAPPER FUNCTIONS - SESSION MEMORY MANAGERS
+# ============================================================================
+
+async def run_leaf_wrapper(state: MainState, leaf_wf):
+    """
+    Wrapper for Tech Lead + Junior Dev workflow
+    
+    CRITICAL MEMORY ARCHITECTURE:
+    1. Starts with EMPTY messages (fresh session)
+    2. Tech Lead accumulates memory DURING session
+    3. Returns ONLY SUMMARY to Architect
+    4. Tech Lead's full session memory DISCARDED
+    """
+    log_terminal("--- [Factory] Deploying Coding Team ---")
+    
+    # EXTRACT PAYLOAD FROM TOOL ARGS
+    _arch_ctx = state.get("architect_context", {})
+    task_description = _arch_ctx.get("task_description", "No task description provided")
+    _project_root = _arch_ctx.get("project_root", "")
+    _base_dir = _arch_ctx.get("base_dir", "")
+    
+    # SESSION INITIALIZATION: Fresh session for Tech Lead
+    # Messages start EMPTY - tech_lead_node will initialize with SystemMessage + task
+    initial_leaf_state = {
+        "messages": [],  # ✓ CRITICAL: Empty = fresh session (no parent memory)
+        "junior_messages": [],
+        "techlead_context": {
+            "agent_id": "tech_lead",
+            "task_description": task_description,
+            "task_context": {},
+            "project_root": _project_root,
+            "base_dir": _base_dir,
+        },
+        "junior_context": {
+            "agent_id": "junior_dev",
+            "task_description": task_description,
+            "task_context": {},
+            "project_root": _project_root,
+            "base_dir": _base_dir,
+        },
+        "scratchpad": "",  # ✓ Fresh scratchpad per session
+        "iterations": 0,
+        "tech_lead_spec": "",
+        "junior_output": "",
+        "text_only_count": 0,
+        "temp_dir": state.get("temp_dir", ""),
+        "run_dir": state.get("run_dir", ""),
+    }
+    
+    # Invoke the sub-graph
+    final_leaf_state = await leaf_wf.ainvoke(initial_leaf_state)
+    
+    # MEMORY EXTRACTION: Get only the SUMMARY for Architect
+    # The full Tech Lead session memory is DISCARDED (ephemeral)
+    final_messages = final_leaf_state.get('messages', [])
+    
+    # PATCHED v4: Extract finish_task summary from tool_call args.
+    # The AIMessage.content is often just reasoning text. The actual
+    # structured summary is in finish_task(summary="...") args.
+    content = ""
+    if final_messages:
+        raw_report = final_messages[-1]
+        
+        # Try to extract from finish_task tool_call args first
+        if hasattr(raw_report, 'tool_calls') and raw_report.tool_calls:
+            for tc in raw_report.tool_calls:
+                if tc.get('name') == 'finish_task':
+                    args = tc.get('args', {})
+                    if isinstance(args, str):
+                        try:
+                            import json as _json
+                            args = _json.loads(args)
+                        except:
+                            pass
+                    content = args.get('summary', '') if isinstance(args, dict) else str(args)
+                    log_terminal(f"[Leaf Wrapper] ✓ Extracted finish_task summary ({len(content)} chars)")
+                    break
+        
+        # Fallback to content if no finish_task found
+        if not content:
+            content = raw_report.content if hasattr(raw_report, 'content') else str(raw_report)
+    
+    if not content:
+        content = "Empty response: The coding team yielded control without messages."
+
+    # PATCHED v6: Read test certificate ONLY if Junior actually ran in THIS session.
+    # Stale certificates from prior runs cause false SUCCESS when Tech Lead
+    # gets force-exited without ever delegating to Junior.
+    cert_proof = None
+    junior_ran_this_session = any(
+        "junior success report" in str(getattr(m, 'content', '')).lower()
+        or "junior failure report" in str(getattr(m, 'content', '')).lower()
+        for m in final_messages
+        if hasattr(m, 'content')
+    )
+    try:
+        cert_path = os.path.join(state.get("architect_context", {}).get("project_root", ""), "test_certificate.json")
+        if os.path.exists(cert_path):
+            if junior_ran_this_session:
+                with open(cert_path, 'r') as _cf:
+                    cert_data = json.loads(_cf.read())
+                if cert_data.get("status") == "PASS":
+                    cert_proof = cert_data
+                    log_terminal(f"[Leaf Wrapper] 📜 Found test certificate: PASS (Junior confirmed this session)")
+                    # Clean up certificate after reading
+                    os.remove(cert_path)
+            else:
+                log_terminal(f"[Leaf Wrapper] ⚠ Found test_certificate.json but Junior did NOT run this session — ignoring stale certificate")
+    except Exception as cert_err:
+        log_terminal(f"[Leaf Wrapper] ⚠ Certificate read failed: {cert_err}")
+
+    # Attempt structured parse
+    parsed = parse_agent_report(content)
+
+    if parsed["is_json"] and parsed["is_success"]:
+        normalized = (
+            f"[Coding Team Report]\n"
+            f"STATUS: SUCCESS\n"
+            f"SUMMARY: {parsed['content']}\n"
+            f"PROOF: {parsed['proof']}\n"
+        )
+    elif cert_proof is not None:
+        # PATCHED v5: Certificate overrides — Junior proved tests pass on disk
+        test_snippet = cert_proof.get("test_output", "")[:500]
+        files_mod = ", ".join(cert_proof.get("files_modified", []))
+        normalized = (
+            f"[Coding Team Report]\n"
+            f"STATUS: SUCCESS\n"
+            f"SUMMARY: Tests passed (certificate recovered from filesystem)\n"
+            f"FILES: {files_mod}\n"
+            f"PROOF (cargo test output):\n{test_snippet}\n"
+        )
+    elif parsed["is_json"] and not parsed["is_success"]:
+        normalized = (
+            f"[Coding Team Report]\n"
+            f"STATUS: FAILURE\n"
+            f"PROBLEM: {parsed['content']}\n"
+            f"GOAL: {parsed['goal']}\n"
+        )
+    else:
+        # Unparseable — Tech Lead exited without structured report
+        truncated = str(content)[:500]
+        normalized = (
+            f"[Coding Team Report]\n"
+            f"STATUS: INCOMPLETE\n"
+            f"PROBLEM: Tech Lead session ended without structured report.\n"
+            f"RAW CONTEXT (truncated): {truncated}\n"
+            f"RECOMMENDATION: Redeploy coding team with same task.\n"
+        )
+
+    report_entry = HumanMessage(content=normalized)
+    return {"messages": state.get("messages", []) + [report_entry]}
+
+
+async def run_integrator_wrapper(state: MainState, model, session: ClientSession, personas, tool_schemas):
+    """
+    Wrapper for Integrator workflow
+    
+    CRITICAL MEMORY ARCHITECTURE:
+    1. Starts with EMPTY session (no messages from Architect)
+    2. Integrator accumulates memory DURING session (multi-turn if needed)
+    3. Returns ONLY SUMMARY to Architect
+    4. Integrator's full session memory DISCARDED
+    """
+    log_terminal("--- [Factory] Deploying Integrator ---")
+    
+    decision_id = get_decision_id("IN")
+    
+    # EXTRACT task from Architect's tool call
+    task_description = state.get("architect_context", {}).get("task_description", "Build and integrate system")
+    
+    log_split(
+        f"--- [HANDOVER RECEIVE] Integrator << Architect ---",
+        f"EXTRACTED PAYLOAD:\n{task_description}"
+    )
+    
+    raw_prompt = personas["integrator"]["system_prompt"]
+    
+    # SESSION INITIALIZATION: Fresh session for Integrator
+    session_messages = [
+        SystemMessage(content=raw_prompt),
+        HumanMessage(content=task_description)
+    ]
+    
+    # Integrator gets code tools but NOT module implementation tools
+    integrator_tools = get_integrator_tools(tool_schemas)
+    
+    # ITERATIVE SESSION: Allow Integrator to work until task completion
+    max_iterations = 5
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
+        
+        # Execute Integrator logic
+        response = await safe_model_call(session_messages, model.bind_tools(integrator_tools), "Integrator", state)
+      
+        # Check for completion signal
+        if not response.tool_calls or "INTEGRATION_COMPLETE" in str(response.content):
+            break
+        
+        # Execute tools and accumulate feedback
+        tool_feedback = []
+        for tc in response.tool_calls:
+            log_terminal(f"[{decision_id}] Action: {tc['name']}")
+            try:
+                res = await session.call_tool(tc["name"], arguments=tc["args"])
+                output = res.content[0].text if res.content else "Done"
+                log_split(f"[{decision_id}] Tool Output: {tc['name']}", output)
+                log_terminal(f"[{decision_id}] Result: {'✓' if 'Error' not in output else '✗'}")
+                tool_feedback.append(f"[{tc['name']}]: {output}")
+            except Exception as e:
+                log_terminal(f"[{decision_id}] Result: ✗ FAILED")
+                tool_feedback.append(f"[{tc['name']}] Error: {str(e)}")
+        
+        # Accumulate session memory
+        feedback_msg = HumanMessage(content="\n".join(tool_feedback))
+        session_messages = list(session_messages) + [response, feedback_msg]
+    
+    # Extract final summary from session (session memory will be discarded)
+    summary = response.content if response.content else "Integration work completed"
+    
+    # Return ONLY summary to Architect (Integrator's session memory discarded)
+    architect_messages = state.get("messages", [])
+    new_architect_messages = list(architect_messages) + [HumanMessage(content=f"[Integrator Report]\n{summary}")]
+    
+    return {"messages": new_architect_messages}
+
+
+async def run_specialist_wrapper(state: MainState, model, session: ClientSession, personas, tool_schemas):
+    """
+    Wrapper for Specialist workflow
+    
+    CRITICAL MEMORY ARCHITECTURE:
+    1. Starts with EMPTY session (no messages from Architect)
+    2. Specialist accumulates memory DURING session (multi-turn recovery)
+    3. Returns ONLY SUMMARY to Architect
+    4. Specialist's full session memory DISCARDED
+    """
+    log_terminal("--- [Factory] Deploying Specialist ---")
+    
+    decision_id = get_decision_id("SP")
+    
+    # EXTRACT task from Architect's tool call
+    task_description = state.get("architect_context", {}).get("task_description", "Emergency recovery needed")
+    
+    log_split(
+        f"--- [HANDOVER RECEIVE] Specialist << Architect ---",
+        f"EXTRACTED PAYLOAD:\n{task_description}"
+    )
+    
+    raw_prompt = personas["specialist"]["system_prompt"]
+    
+    # SESSION INITIALIZATION: Fresh session for Specialist
+    session_messages = [
+        HumanMessage(content=task_description)
+    ]
+    
+    # Specialist gets FULL ACCESS
+    specialist_tools = get_specialist_tools(tool_schemas)
+    
+    # ITERATIVE RECOVERY: Allow Specialist to work until recovery complete
+    max_iterations = 10  # Higher than Integrator (emergency recovery may need more attempts)
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
+        
+        # Execute Specialist logic
+        response = await safe_model_call(session_messages, model.bind_tools(specialist_tools), "Specialist", state)
+        
+      
+        # Check for completion signal
+        if not response.tool_calls or "RECOVERY_COMPLETE" in str(response.content):
+            break
+        
+        # Execute tools and accumulate feedback
+        tool_feedback = []
+        for tc in response.tool_calls:
+            log_terminal(f"[{decision_id}] Action: {tc['name']}")
+            try:
+                res = await session.call_tool(tc["name"], arguments=tc["args"])
+                output = res.content[0].text if res.content else "Done"
+                log_split(f"[{decision_id}] Tool Output: {tc['name']}", output)
+                log_terminal(f"[{decision_id}] Result: {'✓' if 'Error' not in output else '✗'}")
+                tool_feedback.append(f"[{tc['name']}]: {output}")
+            except Exception as e:
+                log_terminal(f"[{decision_id}] Result: ✗ FAILED")
+                tool_feedback.append(f"[{tc['name']}] Error: {str(e)}")
+        
+        # Accumulate session memory
+        feedback_msg = HumanMessage(content="\n".join(tool_feedback))
+        session_messages = list(session_messages) + [response, feedback_msg]
+    
+    # Extract final summary from session (session memory will be discarded)
+    summary = response.content if response.content else "Recovery operations completed"
+    summary_str = str(summary).lower()
+
+    # PATCHED: Detect Specialist failure → HALT with human notice
+    specialist_failed = (
+        iteration >= max_iterations or
+        "unfixable" in summary_str or
+        "cannot fix" in summary_str or
+        "unable to resolve" in summary_str or
+        "halting" in summary_str
+    )
+
+    if specialist_failed:
+        halt_msg = (
+            "\n"
+            "╔══════════════════════════════════════════════════════════════════╗\n"
+            "║  🛑  FACTORY HALTED — SPECIALIST COULD NOT RESOLVE PROBLEM     ║\n"
+            "╠══════════════════════════════════════════════════════════════════╣\n"
+            f"║  Iterations used: {iteration}/{max_iterations}\n"
+            f"║  Last Specialist output (truncated):\n"
+            f"║  {str(summary)[:300]}\n"
+            "║\n"
+            "║  The Specialist (highest authority) was unable to fix the\n"
+            "║  problem. Automated recovery is exhausted.\n"
+            "║\n"
+            "║  HUMAN INTERVENTION REQUIRED:\n"
+            "║  1. Check the detailed log in the run directory\n"
+            "║  2. Review Specialist notes (specialist_notes.md)\n"
+            "║  3. Fix the root cause manually, then re-run\n"
+            "╚══════════════════════════════════════════════════════════════════╝\n"
+        )
+        log_terminal(halt_msg)
+        log_file(halt_msg)
+
+        # Write halt marker for external tooling
+        halt_marker_path = os.path.join(state.get("run_dir", "/tmp"), "HALT_SPECIALIST_FAILURE.txt")
+        try:
+            with open(halt_marker_path, "w") as f:
+                f.write(f"Halted at: {datetime.datetime.utcnow().isoformat()}Z\n")
+                f.write(f"Reason: Specialist exhausted or reported unfixable\n")
+                f.write(f"Summary: {str(summary)[:1000]}\n")
+        except Exception:
+            pass
+
+        # Hard exit
+        import sys as _sys
+        _sys.exit(99)
+
+    # Return ONLY summary to Architect (Specialist's session memory discarded)
+    architect_messages = state.get("messages", [])
+    new_architect_messages = list(architect_messages) + [HumanMessage(content=f"[Specialist Report]\n{summary}")]
+    
+    return {"messages": new_architect_messages}
+
+# ============================================================================
+# MAIN FACTORY EXECUTION
+# ============================================================================
+
+async def run_factory():
+    import os
+    from model_resolver import get_model, ModelRole
+    
+    persona_config = load_persona_config()
+    mission_text, config_dict = load_task_config()
+
+    run_id = config_dict.get("mission_id", "default_run")
+    workspace_paths = prepare_workspace(config_dict, run_id)
+
+    # Initialize Intervention Tracker
+    global _INTERVENTION_TRACKER
+    intervention_log = Path(workspace_paths["run_dir"]) / "specialist_interventions.json"
+    _INTERVENTION_TRACKER = InterventionTracker(str(intervention_log))
+    log_terminal("[Factory] Intervention tracker initialized")
+    project_root = workspace_paths["project_root"]
+     
+    init_input_log(workspace_paths["run_dir"])
+    
+    print("\n" + "="*70)
+    print("TOY CODE FACTORY - AGENTIC BUILD SYSTEM")
+    log_terminal("="*70)
+    print(f"Mission: {config_dict['goal']}")
+    print(f"Language: {config_dict['language']}")
+    print(f"Target: {config_dict.get('target', config_dict.get('language', 'rust'))}")
+    print(f"Workspace: {workspace_paths['base_dir']}")
+    log_terminal("="*70 + "\n")
+    
+    global _CONTRACT_MANAGER
+    log_terminal("[Factory] Initializing contract system...")
+    _CONTRACT_MANAGER = await initialize_contracts_for_run(
+        workspace_base=workspace_paths["base_dir"],
+        task_json_path="task.json",
+        language=config_dict.get("language", config_dict.get("target", "rust")),
+        generate_all=False  # Only generate current phase
+    )
+    current_phase_info = _CONTRACT_MANAGER.get_current_phase_info()
+    
+    smart_model = get_model(ModelRole.SMART, temperature=0)
+    worker_model = get_model(ModelRole.WORKER, temperature=0)
+    better_model = smart_model
+    
+    # Use absolute path to ensure server is found regardless of CWD
+    server_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "infrastructure.py")
+    server_params = StdioServerParameters(command="python", args=[server_script])
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            log_terminal("[INIT] Configuring MCP workspace...")
+            
+            init_result = await session.call_tool(
+                "set_workspace_context",
+                arguments={
+                    "project_root": workspace_paths["project_root"],
+                    "temp_dir": workspace_paths["temp_dir"],
+                    "run_dir": workspace_paths["run_dir"]
+                }
+            )
+            
+            log_terminal(init_result.content[0].text if init_result.content else "Workspace initialized")
+            log_terminal("")
+            
+            mcp_tools = await session.list_tools()
+            control_tools = [deploy_coder, deploy_integrator, deploy_specialist, 
+                           mark_phase_done, list_phase_status]
+            tool_schemas = [{"name": t.name, "description": t.description, "input_schema": t.inputSchema} for t in mcp_tools.tools]
+            all_architect_tools = list(mcp_tools.tools) + control_tools
+            
+            # Build Leaf Workflow (Tech Lead + Junior)
+            leaf_wf = StateGraph(CoderState)
+            leaf_wf.add_node("tech_lead", partial(tech_lead_node, model=better_model, personas=persona_config, tool_schemas=tool_schemas))
+            leaf_wf.add_node("junior_dev", partial(junior_dev_node, model=worker_model, session=session, personas=persona_config, tool_schemas=tool_schemas))
+            leaf_wf.add_node("leaf_tools", partial(leaf_tools_node, session=session))
+            leaf_wf.add_node("leaf_nudge", leaf_nudge_node)
+            leaf_wf.set_entry_point("tech_lead")
+            leaf_wf.add_conditional_edges("tech_lead", leaf_router, {"junior_dev": "junior_dev", "leaf_tools": "leaf_tools", "leaf_nudge": "leaf_nudge", "leaf_finish": END})
+            leaf_wf.add_edge("junior_dev", "tech_lead")
+            leaf_wf.add_edge("leaf_tools", "tech_lead")
+            leaf_wf.add_edge("leaf_nudge", "tech_lead")
+            leaf_app = leaf_wf.compile()
+
+            # Build Main Workflow (Architect + Subordinates)
+            workflow = StateGraph(MainState)
+            workflow.add_node("agent", partial(architect_node, model=better_model, personas=persona_config, tool_schemas=tool_schemas, control_tools=control_tools))
+            workflow.add_node("main_tools", partial(main_tools_node, session=session))
+            
+            # Add wrapper nodes with proper session memory management
+            workflow.add_node("coding_specialist", partial(run_leaf_wrapper, leaf_wf=leaf_app))
+            workflow.add_node("integrator", partial(run_integrator_wrapper, model=worker_model, session=session, personas=persona_config, tool_schemas=tool_schemas))
+            workflow.add_node("specialist", partial(run_specialist_wrapper, model=better_model, session=session, personas=persona_config, tool_schemas=tool_schemas))
+            
+            workflow.set_entry_point("agent")
+            #workflow.set_entry_point("specialist")
+            
+            workflow.add_conditional_edges("agent", main_router, {
+                "agent": "agent",  # Add this line!
+                "enter_leaf": "coding_specialist", 
+                "enter_expert": "specialist",
+                "enter_integrator": "integrator", 
+                "main_tools": "main_tools",
+                "__end__": END
+            })
+            
+            workflow.add_edge("coding_specialist", "agent")
+            workflow.add_edge("integrator", "agent")
+            workflow.add_edge("main_tools", "agent")
+            workflow.add_edge("specialist", "agent")
+            
+            project_root = workspace_paths["project_root"]
+            project_ledger = "NO LEDGER YET"
+
+            # Run workflow
+            _agent_ctx_template = {
+                "agent_id": "",
+                "task_description": mission_text,
+                #"task_description": "TESTING: Perform an emergency audit of the current directory and fix any syntax errors you find.",
+                "task_context": {},
+                "project_root": project_root,
+                "base_dir": workspace_paths["base_dir"],
+            }
+            inputs = {
+                "messages": [], 
+                "architect_context": {**_agent_ctx_template, "agent_id": "architect"},
+                "specialist_context": {**_agent_ctx_template, "agent_id": "specialist"},
+                "integrator_context": {**_agent_ctx_template, "agent_id": "integrator"},
+                "project_ledger": project_ledger,
+                "temp_dir": workspace_paths["temp_dir"],
+                "run_dir": workspace_paths["run_dir"],
+                "architect_text_only_count": 0,
+            }
+            
+            # Define path for the SQLite checkpoint database within the run directory
+            checkpoint_db_path = Path(workspace_paths["run_dir"]) / "checkpoints.sqlite"
+
+
+            # Initialize persistent checkpointer (survives process restarts)
+            async with AsyncSqliteSaver.from_conn_string(str(checkpoint_db_path)) as checkpointer:
+                # Check if restoring from checkpoint
+                if checkpoint_db_path.exists():
+                    log_terminal("⚠️  RESTORATION MODE: Resuming from checkpoint")
+                    inputs["messages"].append(
+                        HumanMessage(content="[SYSTEM ALERT] Workflow restored from checkpoint. LangGraph has recovered all previous state.")
+                    )
+                
+                async for chunk in workflow.compile(checkpointer=checkpointer).astream(inputs, config={"configurable": {"thread_id": "1"}}):
+                    if "agent" in chunk:
+                        last_msg = chunk["agent"]["messages"][-1].content
+                        parsed = parse_agent_report(last_msg)
+                        if parsed["is_json"]:
+                            status = "✅" if parsed["is_success"] else "❌"
+                            log_terminal(f"--- [Report Received] {status} ---")
+                
+                # Print final status (indentation moved inside to be safe, though not strictly required)
+                await print_final_status(session, workspace_paths)
+            
+
+if __name__ == "__main__":
+    asyncio.run(run_factory())
