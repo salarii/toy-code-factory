@@ -1,0 +1,19 @@
+# Model Configuration Blueprint
+# Format: role=model_tier
+
+# Smart models (for complex reasoning, architecture, and critical decisions)
+smart=premium-reasoning-model
+better=premium-reasoning-model
+
+# Worker models (for routine tasks, code generation, and execution)
+worker=standard-utility-model
+dumb=fast-efficiency-model
+
+# Specialized roles
+architect=premium-reasoning-model
+specialist=premium-reasoning-model
+tech_lead=premium-reasoning-model
+integrator=fast-efficiency-model
+junior_dev=fast-efficiency-model
+decomposer=premium-reasoning-model
+contract_generator=premium-reasoning-model
