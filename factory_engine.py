@@ -23,22 +23,6 @@ _GLOBAL_LOG_HANDLE = None
 _TRANSACTION_COUNTER = 0
 _CURRENT_TRANSACTION_ID = None
 
-class LoggerTee:
-    """Redirects writes to both the original stream (terminal) and a log file."""
-    def __init__(self, terminal_stream, log_file):
-        self.terminal = terminal_stream
-        self.log = log_file
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()
-
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
-
-
 def _get_transaction_id(agent_name: str) -> str:
     """Generate unique transaction ID with prefix based on agent."""
     global _TRANSACTION_COUNTER
@@ -161,27 +145,6 @@ def log_output_response(response, label: str = "OUTPUT FROM LLM"):
             log_file(content)
 
 
-def log_tool_results(tool_calls, results, label: str = "TOOL EXECUTION RESULTS"):
-    """Log tool execution results in forensic format (file only)."""
-    if not tool_calls:
-        return
-        
-    log_file(f"\n─── [{label}] {'─' * (60 - len(label))}─\n")
-    
-    for idx, (tc, result) in enumerate(zip(tool_calls, results), 1):
-        tool_name = tc.get('name', 'unknown')
-        log_file(f"[TOOL: {tool_name}]")
-        
-        # Format result nicely
-        if isinstance(result, dict):
-            log_file(json.dumps(result, indent=2))
-        elif isinstance(result, str) and len(result) > 1000:
-            log_file(f"{result[:500]}\n... [truncated] ...\n{result[-500:]}")
-        else:
-            log_file(str(result))
-        log_file("")
-
-
 def log_split(short_msg: str, detailed_content: str):
     """
     Terminal: Shows short_msg only
@@ -198,6 +161,57 @@ def log_split(short_msg: str, detailed_content: str):
 # ═══════════════════════════════════════════════════════════════════════════
 # AGENT REPORT FORMATTING
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+# --- Journal Compression (added by injection.py) ---
+# Known field names that agents use for internal reasoning/journal
+_JOURNAL_FIELD_NAMES = [
+    "journal", "reasoning", "notes", "scratchpad", "thinking",
+    "internal_notes", "thought_process", "analysis_notes",
+    "reflection", "observations", "deliberation",
+]
+_JOURNAL_MAX_CHARS = 300  # Hard cap — keeps it small for downstream
+
+
+def _compress_journal(raw_data: dict) -> str:
+    """
+    Extract journal-like fields from agent JSON output and compress
+    into a single short summary string.
+
+    Returns empty string if no journal content found.
+    """
+    if not isinstance(raw_data, dict):
+        return ""
+
+    fragments = []
+    for key in _JOURNAL_FIELD_NAMES:
+        val = raw_data.get(key)
+        if not val:
+            continue
+        # Normalize to string
+        if isinstance(val, list):
+            val = " | ".join(str(v) for v in val)
+        elif isinstance(val, dict):
+            # Flatten dict values
+            val = " | ".join(f"{k}: {v}" for k, v in val.items())
+        else:
+            val = str(val)
+        val = val.strip()
+        if val:
+            fragments.append(val)
+
+    if not fragments:
+        return ""
+
+    combined = " /// ".join(fragments)
+
+    # Compress: collapse whitespace, trim
+    combined = " ".join(combined.split())
+
+    if len(combined) > _JOURNAL_MAX_CHARS:
+        combined = combined[:_JOURNAL_MAX_CHARS - 3] + "..."
+
+    return combined
 
 
 
@@ -223,6 +237,7 @@ def parse_agent_report(report_str: str) -> Dict[str, Any]:
             "content": data.get("success") if is_success else data.get("problem"),
             "proof": data.get("proof", ""),
             "goal": data.get("goal", ""),
+            "journal_summary": _compress_journal(data),
             "raw": data
         }
     except Exception:
@@ -233,6 +248,7 @@ def parse_agent_report(report_str: str) -> Dict[str, Any]:
             "content": report_str,
             "proof": "",
             "goal": "",
+            "journal_summary": "",
             "raw": None
         }
 
@@ -241,43 +257,7 @@ def parse_agent_report(report_str: str) -> Dict[str, Any]:
 # PERSONA ISOLATION SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _substitute_placeholders(text: str, data: dict) -> str:
-    """
-    Recursively substitute {{key}} and {{nested.key}} placeholders.
-    This fixes the GAP-1 issue where templates weren't being substituted.
-    """
-    import re
-    
-    def get_nested_value(obj, path):
-        """Get value from nested dict using dot notation."""
-        keys = path.split('.')
-        val = obj
-        for key in keys:
-            if isinstance(val, dict) and key in val:
-                val = val[key]
-            else:
-                return None
-        return val
-    
-    # Find all {{...}} patterns
-    pattern = r'\{\{([^}]+)\}\}'
-    
-    def replace_match(match):
-        key = match.group(1).strip()
-        value = get_nested_value(data, key)
-        
-        if value is None:
-            return match.group(0)  # Keep original if not found
-        
-        # Format based on type
-        if isinstance(value, dict):
-            return json.dumps(value, indent=2)
-        elif isinstance(value, list):
-            return json.dumps(value, indent=2)
-        else:
-            return str(value)
-    
-    return re.sub(pattern, replace_match, text)
+
 
 
 
@@ -315,6 +295,102 @@ class CoderState(TypedDict):
     junior_output: str
     scratchpad: str
     text_only_count: int
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UNIFIED SESSION COMPRESSION
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def compress_session_ucp(
+    messages: list,
+    action_type: str,
+    affected_files: list,
+    model,
+    *,
+    role_description: str = "an agent's work session after a file modification",
+    recent_count: int = 6,
+    max_words: int = 200,
+    summary_points: list[str] | None = None,
+    content_truncate: int = 300,
+) -> str:
+    """
+    Unified UCP-MSP compliant memory compression for any agent session.
+
+    Replaces the three near-identical functions:
+      - compress_junior_session_ucp   (recent=5, words=150, 4 points)
+      - compress_specialist_session_ucp (recent=6, words=200, 5 points)
+      - compress_integrator_session_ucp (recent=6, words=200, 4 points)
+
+    Parameters
+    ----------
+    messages : list
+        Full session message history.
+    action_type : str
+        What triggered compression (e.g. "file_write", "build_command").
+    affected_files : list
+        Files touched in this operation.
+    model : LLM
+        Model instance for compression call.
+    role_description : str
+        Human-readable role context injected into the system prompt.
+        E.g. "a Junior Developer's work session after a file modification".
+    recent_count : int
+        How many recent messages to include (from tail).
+    max_words : int
+        Word budget for the summary.
+    summary_points : list[str] | None
+        Numbered bullet points for the system prompt. If None, uses a
+        sensible default set.
+    content_truncate : int
+        Max chars per message content in the log excerpt.
+
+    Returns
+    -------
+    str
+        Compressed summary text.
+    """
+    from langchain_core.messages import SystemMessage as _SM, HumanMessage as _HM
+
+    recent = messages[-recent_count:] if len(messages) > recent_count else messages
+    log_text = "\n".join([
+        f"{msg.__class__.__name__}: {str(msg.content)[:content_truncate] if hasattr(msg, 'content') else str(msg)[:content_truncate]}"
+        for msg in recent
+    ])
+
+    if summary_points is None:
+        summary_points = [
+            "What problem was being solved",
+            "What approach was decided",
+            "What was committed in this file operation",
+            "Expected outcome or remaining issues",
+        ]
+
+    numbered = "\n".join(f"{i+1}. {pt}" for i, pt in enumerate(summary_points))
+
+    instructions = _SM(content=(
+        f"You are compressing {role_description}. "
+        f"Create a BRIEF summary (max {max_words} words) covering:\n"
+        f"{numbered}\n"
+        f"Focus on DECISIONS MADE and RESULTS, not the thinking process."
+    ))
+
+    payload = _HM(content=(
+        f"ACTION COMMITTED: {action_type}\n"
+        f"FILES AFFECTED: {', '.join(affected_files) if affected_files else 'Unknown'}\n"
+        f"\n"
+        f"Session history (last {recent_count} messages):\n"
+        f"{log_text}\n"
+        f"\n"
+        f"Provide ONLY the summary text."
+    ))
+
+    try:
+        response = await model.ainvoke([instructions, payload])
+        return response.content
+    except Exception as e:
+        return f"[Compression failed: {str(e)}] Action: {action_type} on {affected_files}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

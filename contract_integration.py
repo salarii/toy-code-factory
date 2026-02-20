@@ -192,25 +192,7 @@ class ContractManager:
             "contract_path": str(contract_path)
         }
     
-    def mark_phase_complete(self, phase_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Marks phase as complete and returns next phase info.
-        
-        Args:
-            phase_id: Phase to mark complete
-            
-        Returns:
-            Next phase info or None if all complete
-        """
-        plan_manager = self.get_plan_manager()
-        next_phase = plan_manager.consume_phase(phase_id)
-        
-        if next_phase is None:
-            print("[ContractMgr] 🎉 All phases complete!")
-            return None
-        
-        return self.get_current_phase_info()
-    
+
 
     def get_phase_status(self, phase_id: str) -> str:
         """Get current status of a phase."""
@@ -224,121 +206,11 @@ class ContractManager:
         """Get status map for all phases."""
         return self.get_plan_manager().get_all_phase_statuses()
 
-    def get_phases_by_status(self, status: str) -> List[Dict[str, Any]]:
-        """Get all phases matching a specific status."""
-        plan_manager = self.get_plan_manager()
-        statuses = plan_manager.get_all_phase_statuses()
-        matching_ids = [pid for pid, pstat in statuses.items() if pstat == status]
-        return [plan_manager.get_phase_by_id(pid) for pid in matching_ids]
 
-    def generate_tech_lead_contract_context(self, phase_id: str) -> str:
-        """
-        Generates the contract XML block to inject into Tech Lead's system prompt.
-        
-        Args:
-            phase_id: Current phase ID
-            
-        Returns:
-            XML string with contract context
-        """
-        contract_path = self.contracts_dir / f"phase_{phase_id}.json"
-        
-        if not contract_path.exists():
-            return "<contract_error>Contract not found for current phase</contract_error>"
-        
-        with open(contract_path, 'r') as f:
-            contract = json.load(f)
-        
-        # Extract key information for Tech Lead
-        contract_summary = {
-            "phase_id": phase_id,
-            "contracts": []
-        }
-        
-        for task_contract in contract.get("contracts", []):
-            module_spec = task_contract.get("module_spec", {})
-            
-            task_summary = {
-                "contract_id": task_contract.get("contract_id"),
-                "module_name": module_spec.get("module_name"),
-                "file_path": module_spec.get("file_path"),
-                "purpose": module_spec.get("purpose"),
-                "functions": []
-            }
-            
-            # Add function signatures
-            for func in module_spec.get("public_interface", []):
-                func_summary = {
-                    "name": func.get("function_name"),
-                    "signature": func.get("signature"),
-                    "purpose": func.get("purpose", ""),
-                    "parameters": func.get("parameters", []),
-                    "return_type": func.get("return_type"),
-                    "test_count": len(func.get("test_cases", []))
-                }
-                task_summary["functions"].append(func_summary)
-            
-            contract_summary["contracts"].append(task_summary)
-        
-        # Format as XML
-        xml = f"""
-<development_contract>
-<phase_id>{phase_id}</phase_id>
-<contract_path>{contract_path}</contract_path>
 
-<binding_rules>
-1. You MUST implement functions exactly as specified in signatures
-2. Function signatures are IMMUTABLE - you cannot change types or names
-3. You must delegate ONE FUNCTION AT A TIME to Junior Dev
-4. Each function must pass ALL test cases specified in contract
-5. If contract is ambiguous or impossible, escalate to Architect
-</binding_rules>
 
-<contract_summary>
-{json.dumps(contract_summary, indent=2)}
-</contract_summary>
-
-<full_contract>
-{json.dumps(contract, indent=2)}
-</full_contract>
-</development_contract>
-"""
-        
-        return xml
     
-    def extract_function_contract(self, phase_id: str, function_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Extracts a single function's contract for Junior Dev delegation.
-        
-        Args:
-            phase_id: Phase ID
-            function_id: Function identifier (e.g., "F001")
-            
-        Returns:
-            Function contract dictionary or None if not found
-        """
-        contract_path = self.contracts_dir / f"phase_{phase_id}.json"
-        
-        if not contract_path.exists():
-            return None
-        
-        with open(contract_path, 'r') as f:
-            contract = json.load(f)
-        
-        # Search for function
-        for task_contract in contract.get("contracts", []):
-            for func in task_contract.get("module_spec", {}).get("public_interface", []):
-                if func.get("function_id") == function_id or func.get("function_name") == function_id:
-                    # Return function with its test cases
-                    return {
-                        "function": func,
-                        "module_path": task_contract.get("module_spec", {}).get("file_path"),
-                        "test_specifications": [
-                            test for test in task_contract.get("test_specifications", [])
-                        ]
-                    }
-        
-        return None
+
 
 
 # ============================================================================

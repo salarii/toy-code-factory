@@ -35,8 +35,36 @@ from contract_integration import (
 from factory_engine import (MainState, CoderState, AgentContext, safe_model_call,log_split, log_input, init_input_log, 
     log_terminal, log_file, log_transaction_start, log_transaction_end, 
     log_input_messages, log_output_response,
-    prepare_workspace, load_task_config, load_persona_config, parse_agent_report
+    prepare_workspace, load_task_config, load_persona_config, parse_agent_report,
+    compress_session_ucp
 )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DEBUG INFRASTRUCTURE (MACROS & DIRECT JUMP)
+# ═══════════════════════════════════════════════════════════════════════════
+AGENT_NONE = ""
+AGENT_ARCHITECT = "Architect"
+AGENT_TECH_LEAD = "Tech Lead"
+AGENT_JUNIOR_DEV = "Junior Dev"
+AGENT_INTEGRATOR = "Integrator"
+AGENT_SPECIALIST = "Specialist"
+
+# 1️⃣  FLIP THIS to jump directly to any agent at startup
+DEBUG_TARGET = AGENT_INTEGRATOR  # e.g. AGENT_INTEGRATOR, AGENT_SPECIALIST
+
+# 2️⃣  This replaces the agent's task context
+DEBUG_TEST_MESSAGE = """
+[DEBUG OVERRIDE ACTIVE]
+Ignore all previous complex task context.
+Your new test mission is: Respond acknowledging you are online and functioning.
+"""
+
+# 3️⃣  THE debug mission — set this to whatever you want when debugging
+#     This single variable feeds ALL agent contexts during a debug run.
+DEBUG_MISSION = DEBUG_TEST_MESSAGE.strip()
+# ═══════════════════════════════════════════════════════════════════════════
+
+
 
 import datetime
 from pathlib import Path
@@ -200,53 +228,7 @@ def list_phase_status():
     except Exception as e:
         return f"ERROR: Failed to get status - {str(e)}"
 
-# Helper to extract payload safely
-def extract_mission_payload(last_message, tool_name_trigger):
-    """
-    Robustly extracts the 'task' argument from a tool call, handling:
-    1. Standard LangChain tool_calls (dictionary args)
-    2. Stringified JSON args (common LLM quirk)
-    3. Legacy 'function_call' in additional_kwargs (Gemini/OpenAI fallback)
-    4. Argument alias mismatches (task vs task_description)
-    """
-    payload = "No task provided."
 
-    # --- STRATEGY 1: Standard Tool Calls (Modern LangChain) ---
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        for tool_call in last_message.tool_calls:
-            if tool_call["name"] == tool_name_trigger:
-                args = tool_call.get("args", {})
-                
-                # CRITICAL FIX: Sometimes args come as a JSON string, not a dict
-                if isinstance(args, str):
-                    try: args = json.loads(args)
-                    except: pass
-                
-                # Check likely keys
-                payload = args.get("task") or args.get("task_architect") or args.get("problem_description") or args.get("integration_goal")
-                if payload: return payload
-
-    # --- STRATEGY 2: specific fallback for Google/Gemini 'function_call' ---
-    # Sometimes logic bypasses tool_calls and sits in additional_kwargs
-    if hasattr(last_message, "additional_kwargs"):
-        func_call = last_message.additional_kwargs.get("function_call")
-        if func_call and func_call.get("name") == tool_name_trigger:
-            args_str = func_call.get("arguments", "{}")
-            try:
-                args = json.loads(args_str) if isinstance(args_str, str) else args_str
-                payload = args.get("task") or args.get("task_architect")
-                if payload: return payload
-            except: pass
-
-    # --- STRATEGY 3: Last Resort (Content) ---
-    # If the model refused to call the tool but wrote the text, grab the text.
-    if last_message.content and len(last_message.content) > 10:
-        return last_message.content
-
-    if not payload or not isinstance(payload, str) or not payload.strip():
-        return "Proceed with standard execution protocol: Build and Verify."
-        
-    return payload
 
 # ============================================================================
 # DECISION TRACKING
@@ -567,46 +549,6 @@ Provide ONLY the summary text.""")
     response = await model.ainvoke([instructions, payload])
     return response.content
 
-
-async def compress_junior_session_ucp(messages: list, action_type: str, affected_files: list, model) -> str:
-    """
-    UCP-MSP compliant version of compress_junior_session.
-    
-    Compresses Junior Dev's session memory after file operations.
-    ONLY compresses the conversation log, not persona or task.
-    """
-    # Extract last 5 messages for context (execution only)
-    recent_messages = messages[-5:] if len(messages) > 5 else messages
-    log_text = "\n".join([
-        f"{msg.__class__.__name__}: {msg.content if hasattr(msg, 'content') else str(msg)}"
-        for msg in recent_messages
-    ])
-    
-    # API-compliant payload (FIX: SystemMessage + HumanMessage)
-    instructions = SystemMessage(content=(
-        "You are compressing a Junior Developer's work session after a file modification. "
-        "Create a BRIEF summary (max 150 words) covering:\n"
-        "1. What problem was being solved\n"
-        "2. What approach was decided\n"
-        "3. Why this specific file operation was committed\n"
-        "4. Expected outcome\n"
-        "Focus on DECISIONS MADE, not the thinking process or agent identity."
-    ))
-    
-    payload = HumanMessage(content=f"""ACTION COMMITTED: {action_type}
-FILES AFFECTED: {', '.join(affected_files) if affected_files else 'Unknown'}
-
-Session history (last 5 messages):
-{log_text}
-
-Provide ONLY the summary text.""")
-    
-    try:
-        response = await model.ainvoke([instructions, payload])
-        return response.content
-    except Exception as e:
-        return f"[Compression failed: {str(e)}] Action: {action_type} on {affected_files}"
-
 async def junior_dev_node(state: CoderState, model, session: ClientSession, personas, tool_schemas):
     """
     Junior Dev Node - NESTED SESSION MEMORY
@@ -696,11 +638,20 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
                             test_iteration = 0
                         
                         try:
-                            compression_summary = await compress_junior_session_ucp(
+                            compression_summary = await compress_session_ucp(
                                 messages=current_session_messages,
                                 action_type=tc['name'],
                                 affected_files=[affected_file] if 'affected_file' in locals() else [],
-                                model=model
+                                model=model,
+                                role_description="a Junior Developer's work session after a file modification",
+                                recent_count=5,
+                                max_words=150,
+                                summary_points=[
+                                    "What problem was being solved",
+                                    "What approach was decided",
+                                    "Why this specific file operation was committed",
+                                    "Expected outcome",
+                                ],
                             )
                             
                             # Update session with compressed history
@@ -919,10 +870,24 @@ async def architect_node(state: MainState, model, personas, tool_schemas, contro
                 ]
 
                 log_split(f"[{decision_id}] Architect Internal Save Point", internal_summary)
-                return {
-                    "messages": compressed_messages,
-                    "architect_context": {**state.get("architect_context", {}), "task_description": updated_task_desc}
-                }
+                
+                # PATCHED: Write deploy payload to the CORRECT sub-agent context
+                # Architect's own context is PRESERVED (not overwritten)
+                result = {"messages": compressed_messages}
+                
+                if tc['name'] == 'deploy_coder':
+                    # Tech Lead reads from techlead_context (set by run_leaf_wrapper)
+                    # We store in architect_context temporarily; wrapper extracts it
+                    result["architect_context"] = {**state.get("architect_context", {}), "task_description": updated_task_desc}
+                elif tc['name'] == 'deploy_integrator':
+                    result["integrator_context"] = {**state.get("integrator_context", {}), "task_description": updated_task_desc}
+                elif tc['name'] == 'deploy_specialist':
+                    result["specialist_context"] = {**state.get("specialist_context", {}), "task_description": updated_task_desc}
+                else:
+                    # Fallback for unknown deploy targets — safe default
+                    result["architect_context"] = {**state.get("architect_context", {}), "task_description": updated_task_desc}
+                
+                return result
 
             if tc['name'] == 'update_ledger':
                 new_ledger = tc['args'].get('ledger_content', '')
@@ -1231,7 +1196,7 @@ async def print_final_status(session: ClientSession, workspace_paths: dict):
 # WRAPPER FUNCTIONS - SESSION MEMORY MANAGERS
 # ============================================================================
 
-async def run_leaf_wrapper(state: MainState, leaf_wf):
+async def run_leaf_wrapper(state: MainState, leaf_wf, model=None):
     """
     Wrapper for Tech Lead + Junior Dev workflow
     
@@ -1369,18 +1334,39 @@ async def run_leaf_wrapper(state: MainState, leaf_wf):
         )
     else:
         # Unparseable — Tech Lead exited without structured report
+        # Summarize what was actually done in the session for the Architect
         truncated = str(content)[:500]
+        _leaf_session_summary = ""
+        try:
+            _leaf_session_summary = await compress_session_ucp(
+                messages=final_messages,
+                action_type="session_complete",
+                affected_files=[],
+                model=model,
+                role_description="a Tech Lead yielding control back to the Architect",
+                recent_count=8,
+                max_words=250,
+                summary_points=[
+                    "What coding task was assigned",
+                    "What actions were taken (delegation to Junior, file reads, reviews)",
+                    "What was the outcome (code written, tests run, results)",
+                    "Current state of the work (what is done, what is not)",
+                    "Any blockers or issues for the Architect to know about",
+                ],
+            )
+        except Exception:
+            _leaf_session_summary = truncated
         normalized = (
             f"[Coding Team Report]\n"
             f"STATUS: INCOMPLETE\n"
             f"PROBLEM: Tech Lead session ended without structured report.\n"
+            f"SESSION WORK DONE:\n{_leaf_session_summary}\n"
             f"RAW CONTEXT (truncated): {truncated}\n"
             f"RECOMMENDATION: Redeploy coding team with same task.\n"
         )
 
     report_entry = HumanMessage(content=normalized)
     return {"messages": state.get("messages", []) + [report_entry]}
-
 
 async def run_integrator_wrapper(state: MainState, model, session: ClientSession, personas, tool_schemas):
     """
@@ -1396,19 +1382,15 @@ async def run_integrator_wrapper(state: MainState, model, session: ClientSession
     
     decision_id = get_decision_id("IN")
     
-    # EXTRACT task from Architect's tool call
-    task_description = state.get("architect_context", {}).get("task_description", "Build and integrate system")
+    task_description = state.get("integrator_context", {}).get("task_description") 
     
     log_split(
         f"--- [HANDOVER RECEIVE] Integrator << Architect ---",
         f"EXTRACTED PAYLOAD:\n{task_description}"
     )
     
-    raw_prompt = personas["integrator"]["system_prompt"]
-    
     # SESSION INITIALIZATION: Fresh session for Integrator
     session_messages = [
-        SystemMessage(content=raw_prompt),
         HumanMessage(content=task_description)
     ]
     
@@ -1429,8 +1411,11 @@ async def run_integrator_wrapper(state: MainState, model, session: ClientSession
         if not response.tool_calls or "INTEGRATION_COMPLETE" in str(response.content):
             break
         
-        # Execute tools and accumulate feedback
+        # Execute tools and accumulate feedback (with memory compression)
         tool_feedback = []
+        _integrator_wrote_file = False
+        _integrator_ran_build = False
+        _affected_files_this_iter = []
         for tc in response.tool_calls:
             log_terminal(f"[{decision_id}] Action: {tc['name']}")
             try:
@@ -1439,20 +1424,98 @@ async def run_integrator_wrapper(state: MainState, model, session: ClientSession
                 log_split(f"[{decision_id}] Tool Output: {tc['name']}", output)
                 log_terminal(f"[{decision_id}] Result: {'✓' if 'Error' not in output else '✗'}")
                 tool_feedback.append(f"[{tc['name']}]: {output}")
+                
+                # Track file modifications
+                if tc['name'] in ('write_file', 'edit_file_replace'):
+                    _integrator_wrote_file = True
+                    _af = tc['args'].get('filename') or tc['args'].get('path') or 'unknown'
+                    _affected_files_this_iter.append(_af)
+                
+                # Track build/test commands (these produce large outputs)
+                if tc['name'] == 'run_command':
+                    _cmd = tc['args'].get('command', '').lower()
+                    if any(kw in _cmd for kw in ['cargo build', 'cargo test', 'cargo check', 'make', 'npm run', 'pytest', 'go build', 'go test']):
+                        _integrator_ran_build = True
+                        _affected_files_this_iter.append(f"cmd:{_cmd[:60]}")
+                    
             except Exception as e:
                 log_terminal(f"[{decision_id}] Result: ✗ FAILED")
                 tool_feedback.append(f"[{tc['name']}] Error: {str(e)}")
         
-        # Accumulate session memory
-        feedback_msg = HumanMessage(content="\n".join(tool_feedback))
-        session_messages = list(session_messages) + [response, feedback_msg]
+        # MEMORY COMPRESSION: Compress after file writes or build commands
+        _should_compress = (_integrator_wrote_file or _integrator_ran_build) and len(session_messages) > 4
+        if _should_compress:
+            log_terminal(f"[{decision_id}] 🧠 Integrator committed {'file write' if _integrator_wrote_file else 'build'} — compressing memory...")
+            try:
+                _int_compression = await compress_session_ucp(
+                    messages=session_messages + [response],
+                    action_type="file_write" if _integrator_wrote_file else "build_command",
+                    affected_files=_affected_files_this_iter,
+                    model=model,
+                    role_description="an Integrator's work session after a file or build operation",
+                    recent_count=6,
+                    max_words=200,
+                    summary_points=[
+                        "What integration task was being performed",
+                        "Which files were modified or what build was run",
+                        "Result of the operation (success/failure, key output)",
+                        "Remaining integration steps or blockers",
+                    ],
+                )
+                # Compressed session: keep system prompt + task + summary + current
+                session_messages = [
+                    HumanMessage(content=task_description),  # Original task
+                    HumanMessage(content=f"### INTEGRATOR WORK SUMMARY ###\n{_int_compression}"),
+                    response,
+                    HumanMessage(content="\n".join(tool_feedback))
+                ]
+                log_terminal(f"[{decision_id}] ✓ Integrator memory compressed")
+            except Exception as _comp_err:
+                log_terminal(f"[{decision_id}] ⚠ Compression failed: {_comp_err}")
+                feedback_msg = HumanMessage(content="\n".join(tool_feedback))
+                session_messages = list(session_messages) + [response, feedback_msg]
+        else:
+            # Normal accumulation
+            feedback_msg = HumanMessage(content="\n".join(tool_feedback))
+            session_messages = list(session_messages) + [response, feedback_msg]
     
     # Extract final summary from session (session memory will be discarded)
-    summary = response.content if response.content else "Integration work completed"
-    
+    raw_summary = response.content if response.content else "Integration work completed"
+
+    # SUMMARIZE what was done across the whole session for the Architect
+    _integrator_session_summary = ""
+    try:
+        _integrator_session_summary = await compress_session_ucp(
+            messages=session_messages,
+            action_type="session_complete",
+            affected_files=[],
+            model=model,
+            role_description="an Integrator yielding control back to the Architect",
+            recent_count=8,
+            max_words=250,
+            summary_points=[
+                "What integration goal was assigned",
+                "What actions were taken (files written, commands run)",
+                "What was the outcome of each major action",
+                "Current state of the integration (what works, what does not)",
+                "Any remaining work or blockers for the Architect to know about",
+            ],
+        )
+    except Exception as _sum_err:
+        log_terminal(f"[{decision_id}] ⚠ Integrator session summarization failed: {_sum_err}")
+        _integrator_session_summary = str(raw_summary)[:800]
+
+    normalized_report = (
+        f"[Integrator Report]\n"
+        f"ITERATIONS: {iteration}/{max_iterations}\n"
+        f"STATUS: {'SUCCESS' if 'INTEGRATION_COMPLETE' in str(raw_summary) or iteration < max_iterations else 'INCOMPLETE'}\n"
+        f"SUMMARY: {str(raw_summary)[:800]}\n"
+        f"SESSION WORK DONE:\n{_integrator_session_summary}\n"
+    )
+
     # Return ONLY summary to Architect (Integrator's session memory discarded)
     architect_messages = state.get("messages", [])
-    new_architect_messages = list(architect_messages) + [HumanMessage(content=f"[Integrator Report]\n{summary}")]
+    new_architect_messages = list(architect_messages) + [HumanMessage(content=normalized_report)]
     
     return {"messages": new_architect_messages}
 
@@ -1471,15 +1534,14 @@ async def run_specialist_wrapper(state: MainState, model, session: ClientSession
     
     decision_id = get_decision_id("SP")
     
-    # EXTRACT task from Architect's tool call
-    task_description = state.get("architect_context", {}).get("task_description", "Emergency recovery needed")
+    # EXTRACT task from Specialist's own context (PATCHED: was reading architect_context)
+    task_description = state.get("specialist_context", {}).get("task_description") \
+        or state.get("architect_context", {}).get("task_description", "Emergency recovery needed")
     
     log_split(
         f"--- [HANDOVER RECEIVE] Specialist << Architect ---",
         f"EXTRACTED PAYLOAD:\n{task_description}"
     )
-    
-    raw_prompt = personas["specialist"]["system_prompt"]
     
     # SESSION INITIALIZATION: Fresh session for Specialist
     session_messages = [
@@ -1504,8 +1566,10 @@ async def run_specialist_wrapper(state: MainState, model, session: ClientSession
         if not response.tool_calls or "RECOVERY_COMPLETE" in str(response.content):
             break
         
-        # Execute tools and accumulate feedback
+        # Execute tools and accumulate feedback (with memory compression)
         tool_feedback = []
+        _specialist_wrote_file = False
+        _affected_files_this_iter = []
         for tc in response.tool_calls:
             log_terminal(f"[{decision_id}] Action: {tc['name']}")
             try:
@@ -1514,13 +1578,60 @@ async def run_specialist_wrapper(state: MainState, model, session: ClientSession
                 log_split(f"[{decision_id}] Tool Output: {tc['name']}", output)
                 log_terminal(f"[{decision_id}] Result: {'✓' if 'Error' not in output else '✗'}")
                 tool_feedback.append(f"[{tc['name']}]: {output}")
+                
+                # Track file modifications for compression trigger
+                if tc['name'] in ('write_file', 'edit_file_replace'):
+                    _specialist_wrote_file = True
+                    _af = tc['args'].get('filename') or tc['args'].get('path') or 'unknown'
+                    _affected_files_this_iter.append(_af)
+                    
             except Exception as e:
                 log_terminal(f"[{decision_id}] Result: ✗ FAILED")
                 tool_feedback.append(f"[{tc['name']}] Error: {str(e)}")
         
-        # Accumulate session memory
-        feedback_msg = HumanMessage(content="\n".join(tool_feedback))
-        session_messages = list(session_messages) + [response, feedback_msg]
+        # MEMORY COMPRESSION: Compress after file writes (mirrors Junior behavior)
+        if _specialist_wrote_file and len(session_messages) > 4:
+            log_terminal(f"[{decision_id}] 🧠 Specialist committed file operation — compressing memory...")
+            
+            # Reset iteration counter on productive work
+            if iteration > 1:
+                log_terminal(f"[{decision_id}] ✓ Productive work detected — resetting iteration counter (was: {iteration})")
+                iteration = 1
+            
+            try:
+                _sp_compression = await compress_session_ucp(
+                    messages=session_messages + [response],
+                    action_type="file_write",
+                    affected_files=_affected_files_this_iter,
+                    model=model,
+                    role_description="a Specialist's emergency recovery session after a file modification",
+                    recent_count=6,
+                    max_words=200,
+                    summary_points=[
+                        "What problem was being diagnosed",
+                        "Root cause identified (if any)",
+                        "What fix was applied in this file operation",
+                        "Remaining issues or next steps",
+                        "Any CAPABILITY GAPS discovered (missing tools, permissions, dependencies)",
+                    ],
+                )
+                # Compressed session: keep task + summary + current response
+                session_messages = [
+                    HumanMessage(content=task_description),  # Original task
+                    HumanMessage(content=f"### SPECIALIST WORK SUMMARY ###\n{_sp_compression}"),
+                    response,
+                    HumanMessage(content="\n".join(tool_feedback))
+                ]
+                log_terminal(f"[{decision_id}] ✓ Specialist memory compressed")
+            except Exception as _comp_err:
+                log_terminal(f"[{decision_id}] ⚠ Compression failed: {_comp_err}")
+                # Fallback: normal accumulation
+                feedback_msg = HumanMessage(content="\n".join(tool_feedback))
+                session_messages = list(session_messages) + [response, feedback_msg]
+        else:
+            # Normal accumulation (no file write this iteration)
+            feedback_msg = HumanMessage(content="\n".join(tool_feedback))
+            session_messages = list(session_messages) + [response, feedback_msg]
     
     # Extract final summary from session (session memory will be discarded)
     summary = response.content if response.content else "Recovery operations completed"
@@ -1571,9 +1682,51 @@ async def run_specialist_wrapper(state: MainState, model, session: ClientSession
         import sys as _sys
         _sys.exit(99)
 
+    # STRUCTURED RETURN: Capability-gap detection + report normalization
+    # Mirrors Junior/TechLead pattern: "seems lacking these capabilities: ..."
+    _sp_summary_str = str(summary)
+    
+    # Detect capability gaps from Specialist's session
+    _capability_gaps = []
+    for msg in session_messages:
+        _msg_text = str(msg.content) if hasattr(msg, 'content') else str(msg)
+        # Look for common gap indicators in tool outputs and specialist reasoning
+        if any(kw in _msg_text.lower() for kw in [
+            'permission denied', 'not found', 'no such file', 'command not found',
+            'missing dependency', 'missing module', 'import error', 'modulenotfounderror',
+            'not installed', 'unavailable', 'unsupported', 'cannot access'
+        ]):
+            # Extract the relevant line (truncated)
+            for line in _msg_text.split('\n'):
+                if any(kw in line.lower() for kw in [
+                    'permission denied', 'not found', 'command not found',
+                    'missing', 'import error', 'not installed', 'unavailable'
+                ]):
+                    _capability_gaps.append(line.strip()[:200])
+    
+    # Deduplicate
+    _capability_gaps = list(dict.fromkeys(_capability_gaps))[:5]
+    
+    # Build structured report
+    _gap_section = ""
+    if _capability_gaps:
+        _gap_lines = "\n".join(f"  - {g}" for g in _capability_gaps)
+        _gap_section = (
+            f"\nCAPABILITY GAPS DETECTED:\n"
+            f"Seems lacking these capabilities:\n{_gap_lines}\n"
+        )
+    
+    normalized_report = (
+        f"[Specialist Report]\n"
+        f"ITERATIONS: {iteration}/{max_iterations}\n"
+        f"STATUS: {'SUCCESS' if not specialist_failed else 'FAILED'}\n"
+        f"SUMMARY: {_sp_summary_str[:800]}\n"
+        f"{_gap_section}"
+    )
+    
     # Return ONLY summary to Architect (Specialist's session memory discarded)
     architect_messages = state.get("messages", [])
-    new_architect_messages = list(architect_messages) + [HumanMessage(content=f"[Specialist Report]\n{summary}")]
+    new_architect_messages = list(architect_messages) + [HumanMessage(content=normalized_report)]
     
     return {"messages": new_architect_messages}
 
@@ -1651,6 +1804,119 @@ async def run_factory():
             tool_schemas = [{"name": t.name, "description": t.description, "input_schema": t.inputSchema} for t in mcp_tools.tools]
             all_architect_tools = list(mcp_tools.tools) + control_tools
             
+
+            # ── DEBUG DIRECT JUMP ────────────────────────────────────
+            if DEBUG_TARGET:
+                import sys as _dbg_sys
+                print(f"\n<<-- DEBUG-DELIMITER -->>")
+                print(f"[⚙️ DEBUG] DIRECT JUMP → {DEBUG_TARGET}")
+                print(f"<<-- DEBUG-DELIMITER -->>\n")
+
+                # Build a minimal MainState so the wrapper has what it needs
+                _dbg_state = {
+                    "messages": [],
+                    "architect_context": {
+                        "agent_id": "debug",
+                        "task_description": DEBUG_MISSION,
+                        "task_context": {},
+                        "project_root": project_root,
+                        "base_dir": workspace_paths["base_dir"],
+                    },
+                    "specialist_context": {
+                        "agent_id": "specialist",
+                        "task_description": DEBUG_MISSION,
+                        "task_context": {},
+                        "project_root": project_root,
+                        "base_dir": workspace_paths["base_dir"],
+                    },
+                    "integrator_context": {
+                        "agent_id": "integrator",
+                        "task_description": DEBUG_MISSION,
+                        "task_context": {},
+                        "project_root": project_root,
+                        "base_dir": workspace_paths["base_dir"],
+                    },
+                    "project_ledger": "",
+                    "temp_dir": workspace_paths["temp_dir"],
+                    "run_dir": workspace_paths["run_dir"],
+                    "architect_text_only_count": 0,
+                }
+
+                if DEBUG_TARGET == AGENT_INTEGRATOR:
+                    result = await run_integrator_wrapper(_dbg_state, model=worker_model, session=session, personas=persona_config, tool_schemas=tool_schemas)
+                elif DEBUG_TARGET == AGENT_SPECIALIST:
+                    result = await run_specialist_wrapper(_dbg_state, model=better_model, session=session, personas=persona_config, tool_schemas=tool_schemas)
+                elif DEBUG_TARGET == AGENT_ARCHITECT:
+                    result = await architect_node(_dbg_state, model=better_model, personas=persona_config, tool_schemas=tool_schemas, control_tools=control_tools)
+                elif DEBUG_TARGET == AGENT_TECH_LEAD:
+                    _dbg_leaf_state = {
+                        "messages": [],
+                        "junior_messages": [],
+                        "techlead_context": {
+                            "agent_id": "tech_lead",
+                            "task_description": DEBUG_MISSION,
+                            "task_context": {},
+                            "project_root": project_root,
+                            "base_dir": workspace_paths["base_dir"],
+                        },
+                        "junior_context": {
+                            "agent_id": "junior_dev",
+                            "task_description": DEBUG_MISSION,
+                            "task_context": {},
+                            "project_root": project_root,
+                            "base_dir": workspace_paths["base_dir"],
+                        },
+                        "scratchpad": "",
+                        "iterations": 0,
+                        "tech_lead_spec": "",
+                        "junior_output": "",
+                        "text_only_count": 0,
+                        "temp_dir": workspace_paths["temp_dir"],
+                        "run_dir": workspace_paths["run_dir"],
+                    }
+                    result = await tech_lead_node(_dbg_leaf_state, model=better_model, personas=persona_config, tool_schemas=tool_schemas)
+                elif DEBUG_TARGET == AGENT_JUNIOR_DEV:
+                    _dbg_coder_state = {
+                        "messages": [],
+                        "junior_messages": [],
+                        "techlead_context": {
+                            "agent_id": "tech_lead",
+                            "task_description": DEBUG_MISSION,
+                            "task_context": {},
+                            "project_root": project_root,
+                            "base_dir": workspace_paths["base_dir"],
+                        },
+                        "junior_context": {
+                            "agent_id": "junior_dev",
+                            "task_description": DEBUG_MISSION,
+                            "task_context": {},
+                            "project_root": project_root,
+                            "base_dir": workspace_paths["base_dir"],
+                        },
+                        "scratchpad": "",
+                        "iterations": 0,
+                        "tech_lead_spec": "",
+                        "junior_output": "",
+                        "text_only_count": 0,
+                        "temp_dir": workspace_paths["temp_dir"],
+                        "run_dir": workspace_paths["run_dir"],
+                    }
+                    result = await junior_dev_node(_dbg_coder_state, model=worker_model, session=session, personas=persona_config, tool_schemas=tool_schemas)
+                else:
+                    print(f"[⚙️ DEBUG] Unknown DEBUG_TARGET: {DEBUG_TARGET}")
+                    _dbg_sys.exit(1)
+
+                print(f"\n<<-- DEBUG-DELIMITER -->>")
+                print(f"[⚙️ DEBUG] {DEBUG_TARGET} completed naturally.")
+                print(f"[⚙️ DEBUG] Result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+                if isinstance(result, dict):
+                    for k, v in result.items():
+                        preview = str(v)[:300] if v else "None"
+                        print(f"[⚙️ DEBUG]   {k}: {preview}")
+                print(f"<<-- DEBUG-DELIMITER -->>\n")
+                _dbg_sys.exit(0)
+            # ── END DEBUG DIRECT JUMP ────────────────────────────────
+
             # Build Leaf Workflow (Tech Lead + Junior)
             leaf_wf = StateGraph(CoderState)
             leaf_wf.add_node("tech_lead", partial(tech_lead_node, model=better_model, personas=persona_config, tool_schemas=tool_schemas))
@@ -1670,7 +1936,7 @@ async def run_factory():
             workflow.add_node("main_tools", partial(main_tools_node, session=session))
             
             # Add wrapper nodes with proper session memory management
-            workflow.add_node("coding_specialist", partial(run_leaf_wrapper, leaf_wf=leaf_app))
+            workflow.add_node("coding_specialist", partial(run_leaf_wrapper, leaf_wf=leaf_app, model=better_model))
             workflow.add_node("integrator", partial(run_integrator_wrapper, model=worker_model, session=session, personas=persona_config, tool_schemas=tool_schemas))
             workflow.add_node("specialist", partial(run_specialist_wrapper, model=better_model, session=session, personas=persona_config, tool_schemas=tool_schemas))
             
@@ -1698,7 +1964,7 @@ async def run_factory():
             _agent_ctx_template = {
                 "agent_id": "",
                 "task_description": mission_text,
-                #"task_description": "TESTING: Perform an emergency audit of the current directory and fix any syntax errors you find.",
+                #"task_description": "TESTING: This is an infrastructure test. Just tell me how you are doing. Save it as a text file and verify that you have done so. Yield control; system command chain integrity check.",
                 "task_context": {},
                 "project_root": project_root,
                 "base_dir": workspace_paths["base_dir"],
