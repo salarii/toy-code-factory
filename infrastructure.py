@@ -382,8 +382,8 @@ def read_file(filename: str) -> str:
             content = f.read()
         
         # Truncate if too long
-        if len(content) > 1000:
-            return f"[Showing last 1000 chars of '{filename}']\n...\n{content[-1000:]}"
+        if len(content) > 50000:
+            return f"[Showing last 50000 chars of '{filename}']\n...\n{content[-1000:]}"
         
         return content
     except Exception as e:

@@ -33,8 +33,8 @@ class DevelopmentPlan:
             contracts_dir: Directory where contract files are stored (default: contracts)
         """
         self.plan_path = Path(plan_path)
-        self.progress_path = Path(progress_path or "dev_progress.json")
-        self.contracts_dir = Path("contracts")
+        self.progress_path = Path(progress_path or (self.plan_path.parent / "dev_progress.json"))
+        self.contracts_dir = self.plan_path.parent / "contracts"
         
         # Load plan
         with open(self.plan_path, 'r') as f:

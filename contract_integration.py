@@ -16,6 +16,7 @@ sys.path.append('/workspace/decomposer')
 from task_decomposer import decompose_task
 from contract_generator import generate_phase_contract, ContractStore, validate_contract_completeness
 from plan_manager import DevelopmentPlan
+from model_resolver import get_model
 
 
 class ContractManager:
@@ -37,15 +38,44 @@ class ContractManager:
             workspace_base: Base directory (e.g., /workspace/{run_id}/generated)
         """
         self.workspace_base = Path(workspace_base)
-        self.dev_plan_path = self.workspace_base / "dev_plan.json"
-        self.contracts_dir = self.workspace_base / "contracts"
-        self.progress_path = self.workspace_base / "dev_progress.json"
+        self.factory_dir = self.workspace_base / ".factory"
+        self.factory_dir.mkdir(parents=True, exist_ok=True)
+        self.dev_plan_path = self.factory_dir / "dev_plan.json"
+        self.contracts_dir = self.factory_dir / "contracts"
+        self.progress_path = self.factory_dir / "dev_progress.json"
         
         # Ensure directories exist
         self.contracts_dir.mkdir(parents=True, exist_ok=True)
         
         self.plan_manager: Optional[DevelopmentPlan] = None
         self.contract_store = ContractStore(str(self.contracts_dir))
+        
+            async def ensure_phase_contract(self, phase_id: str, language: str = "rust") -> bool:
+                """
+                JIT (Just-In-Time) Trigger: Checks if a phase contract exists.
+                If not, automatically invokes the LLM to generate it before proceeding.
+                """
+                contract_path = self.contracts_dir / f"phase_{phase_id}.json"
+                if contract_path.exists():
+                    return True
+                    
+                print(f"\n[Factory Engine] ⚙️ LAZY GENERATION TRIGGERED FOR PHASE: {phase_id}")
+                
+                if not self.plan_manager:
+                    self.plan_manager = DevelopmentPlan(str(self.dev_plan_path), str(self.progress_path))
+                    
+                phase_data = next((p for p in self.plan_manager.plan.get("phases", []) 
+                                   if p.get("phase_id") == phase_id), None)
+                                   
+                if not phase_data:
+                    print(f"[Factory Engine] ❌ Error: Phase {phase_id} not found in dev_plan.json")
+                    return False
+                    
+                # Actively trigger the generation
+                contract = await generate_phase_contract(phase_data, language)
+                self.contract_store.save_contract(contract, f"phase_{phase_id}")
+                print(f"[Factory Engine] ✅ Successfully lazy-generated contract for {phase_id}")
+                return True
     
     def contracts_exist(self) -> bool:
         """Check if essential contract artifacts already exist."""

@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Annotated, TypedDict, Literal, Optional, Dict, Any
 from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LOGGING SYSTEM - TWO PATH ARCHITECTURE
@@ -253,11 +254,46 @@ def parse_agent_report(report_str: str) -> Dict[str, Any]:
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PERSONA ISOLATION SYSTEM
-# ═══════════════════════════════════════════════════════════════════════════
+def sanitize_ai_message(message: BaseMessage) -> BaseMessage:
+    """Removes leaked metadata/signatures from LLM outputs."""
+    if not hasattr(message, "content"):
+        return message
+        
+    # If the content is a list of blocks
+    if isinstance(message.content, list):
+        clean_blocks = []
+        for block in message.content:
+            if isinstance(block, dict):
+                # Strip out the 'extras' key which contains the signature
+                if "extras" in block:
+                    cleaned_dict = {k: v for k, v in block.items() if k != "extras"}
+                    clean_blocks.append(cleaned_dict)
+                else:
+                    clean_blocks.append(block)
+            elif isinstance(block, str):
+                clean_blocks.append(block)
+                
+        # Create a new, clean message (preserving attributes)
+        if isinstance(message, AIMessage):
+            new_msg = AIMessage(content=clean_blocks)
+            if hasattr(message, "tool_calls"):
+                new_msg.tool_calls = message.tool_calls
+            if hasattr(message, "response_metadata"):
+                new_msg.response_metadata = message.response_metadata
+            if hasattr(message, "id"):
+                new_msg.id = message.id
+            return new_msg
+        else:
+            message.content = clean_blocks
+            return message
+            
+    return message
 
 
+async def call_model_safely(model, messages):
+    """Centralized wrapper that calls the LLM and automatically sanitizes the output."""
+    response = await model.ainvoke(messages)
+    return sanitize_ai_message(response)
 
 
 
@@ -387,7 +423,7 @@ async def compress_session_ucp(
     ))
 
     try:
-        response = await model.ainvoke([instructions, payload])
+        response = await call_model_safely(model, [instructions, payload])
         return response.content
     except Exception as e:
         return f"[Compression failed: {str(e)}] Action: {action_type} on {affected_files}"
@@ -568,7 +604,7 @@ async def safe_model_call(messages, model, agent_name, agent_id=None, personas_c
         log_input_messages(messages)
     
     # Execute inference
-    response = await model.ainvoke(messages)
+    response = await call_model_safely(model, messages)
     
     # PATH 1: TERMINAL - Result indicator
     content_str = str(response.content) if hasattr(response, 'content') else ""

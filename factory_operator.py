@@ -36,7 +36,7 @@ from factory_engine import (MainState, CoderState, AgentContext, safe_model_call
     log_terminal, log_file, log_transaction_start, log_transaction_end, 
     log_input_messages, log_output_response,
     prepare_workspace, load_task_config, load_persona_config, parse_agent_report,
-    compress_session_ucp
+    compress_session_ucp, call_model_safely
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -50,7 +50,7 @@ AGENT_INTEGRATOR = "Integrator"
 AGENT_SPECIALIST = "Specialist"
 
 # 1️⃣  FLIP THIS to jump directly to any agent at startup
-DEBUG_TARGET = AGENT_INTEGRATOR  # e.g. AGENT_INTEGRATOR, AGENT_SPECIALIST
+DEBUG_TARGET = AGENT_NONE  # e.g. AGENT_INTEGRATOR, AGENT_SPECIALIST
 
 # 2️⃣  This replaces the agent's task context
 DEBUG_TEST_MESSAGE = """
@@ -546,7 +546,7 @@ EXECUTION LOG:
 
 Provide ONLY the summary text.""")
     
-    response = await model.ainvoke([instructions, payload])
+    response = await call_model_safely(model, [instructions, payload])
     return response.content
 
 async def junior_dev_node(state: CoderState, model, session: ClientSession, personas, tool_schemas):
@@ -594,7 +594,7 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
     current_session_messages =[]
 
     current_session_messages.append(
-        HumanMessage(content=f"{context_header}\nExecute this plan:\n{task_description}") 
+        HumanMessage(content=f"{context_header}\nPay attention you received task proceed to accomplish:\n{task_description}") 
    )
 
     while test_iteration < MAX_TEST_ITERATIONS and not build_success:
@@ -629,8 +629,8 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
                         modified_files.append(affected_file)
 
                     file_modification_actions = ['write_file', 'edit_file_replace']
-                    if tc['name'] in file_modification_actions:
-                        log_terminal(f"[{decision_id}] 🧠 Junior committed to file operation - compressing memory...")
+                    if ( tc['name'] in file_modification_actions ) or (test_iteration >= 7):
+                        log_terminal(f"[{decision_id}] 🧠 Junior committed to file operation/ or long memory - compressing memory...")
                         
                         # Reset iteration counter on productive work
                         if test_iteration > 0:
@@ -656,7 +656,7 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
                             
                             # Update session with compressed history
                             current_session_messages = [
-                                HumanMessage(content=f"{context_header}\nExecute this plan:\n{task_description}"),
+                                HumanMessage(content=f"{context_header}\nPay attention you received task proceed to accomplish:\n{task_description}"),
                                 HumanMessage(content=f"### WORK SUMMARY ###\n{compression_summary}"),
                                 response  # Current decision
                             ]
@@ -763,7 +763,7 @@ async def summarize_current_state_ucp(messages: list, model) -> str:
     
     payload = HumanMessage(content=f"Synthesize current state from history:\n\n{log_text}")
     
-    response = await model.ainvoke([instructions, payload])
+    response = await call_model_safely(model, [instructions, payload])
     return response.content
 
 
@@ -855,43 +855,40 @@ async def architect_node(state: MainState, model, personas, tool_schemas, contro
     # --- 5. POST-PROCESSING (Delegation logic) ------------------------------
     if hasattr(response, 'tool_calls') and response.tool_calls:
         for tc in response.tool_calls:
+            # We start with a default state update
+            state_update = {"messages": messages + [response]}
             
-            if tc['name'].startswith("deploy_"):
-                target_agent = tc['name'].replace("deploy_", "").upper()
-                log_terminal(f"[{decision_id}] 🧠 Compressing internal memory for {target_agent} deployment...")
-                
-                internal_summary = await summarize_current_state_ucp(messages + [response], model)
-                
-                updated_task_desc = tc['args'].get('task') or tc['args'].get('task_description') or \
-                                   tc['args'].get('problem_description') or tc['args'].get('integration_goal') or "Execute."
-                compressed_messages = [
-                    HumanMessage(content=f"### INTERNAL STATE SUMMARY ###\n{internal_summary}"),
-                    response
-                ]
+            for tc in response.tool_calls:
+                # 1. Handle Deployments (Set up the sub-agent's context)
+                if tc['name'].startswith("deploy_"):
+                    target_agent = tc['name'].replace("deploy_", "").upper()
+                    log_terminal(f"[{decision_id}] 🧠 Compressing internal memory for {target_agent} deployment...")
+                    
+                    internal_summary = await summarize_current_state_ucp(messages + [response], model)
+                    updated_task_desc = tc['args'].get('task') or tc['args'].get('task_description') or \
+                                    tc['args'].get('problem_description') or tc['args'].get('integration_goal') or "Execute."
+                    
+                    # Compress the Architect's memory
+                    state_update["messages"] = [
+                        HumanMessage(content=f"### INTERNAL STATE SUMMARY ###\n{internal_summary}"),
+                        response
+                    ]
+                    
+                    # Inject the task payload into the correct target context
+                    if tc['name'] == 'deploy_coder':
+                        state_update["architect_context"] = {**state.get("architect_context", {}), "task_description": updated_task_desc}
+                    elif tc['name'] == 'deploy_integrator':
+                        state_update["integrator_context"] = {**state.get("integrator_context", {}), "task_description": updated_task_desc}
+                    elif tc['name'] == 'deploy_specialist':
+                        state_update["specialist_context"] = {**state.get("specialist_context", {}), "task_description": updated_task_desc}
 
-                log_split(f"[{decision_id}] Architect Internal Save Point", internal_summary)
-                
-                # PATCHED: Write deploy payload to the CORRECT sub-agent context
-                # Architect's own context is PRESERVED (not overwritten)
-                result = {"messages": compressed_messages}
-                
-                if tc['name'] == 'deploy_coder':
-                    # Tech Lead reads from techlead_context (set by run_leaf_wrapper)
-                    # We store in architect_context temporarily; wrapper extracts it
-                    result["architect_context"] = {**state.get("architect_context", {}), "task_description": updated_task_desc}
-                elif tc['name'] == 'deploy_integrator':
-                    result["integrator_context"] = {**state.get("integrator_context", {}), "task_description": updated_task_desc}
-                elif tc['name'] == 'deploy_specialist':
-                    result["specialist_context"] = {**state.get("specialist_context", {}), "task_description": updated_task_desc}
-                else:
-                    # Fallback for unknown deploy targets — safe default
-                    result["architect_context"] = {**state.get("architect_context", {}), "task_description": updated_task_desc}
-                
-                return result
-
-            if tc['name'] == 'update_ledger':
-                new_ledger = tc['args'].get('ledger_content', '')
-                return {"project_ledger": new_ledger, "messages": messages + [response]}
+                # 2. Handle Ledger Updates
+                elif tc['name'] == 'update_ledger':
+                    state_update["project_ledger"] = tc['args'].get('ledger_content', '')
+                    
+            # We process ALL requested tools in the array before returning!
+            state_update["architect_text_only_count"] = 0
+            return state_update
 
     # PATCHED: Track text-only iterations — circuit breaker for self-loop
     MAX_ARCHITECT_TEXT_ONLY = 3
@@ -926,6 +923,10 @@ async def main_tools_node(state: MainState, session: ClientSession):
     CONTROL_TOOL_MAP = {
         "mark_phase_done": lambda args: mark_phase_done.invoke(args),
         "list_phase_status": lambda args: list_phase_status.invoke({}),
+        "deploy_coder": lambda args: deploy_coder.invoke(args),
+        "deploy_integrator": lambda args: deploy_integrator.invoke(args),
+        "deploy_specialist": lambda args: deploy_specialist.invoke(args),
+        "update_ledger": lambda args: update_ledger.invoke(args)
     }
 
     if hasattr(last_msg, "tool_calls"):
@@ -1068,28 +1069,33 @@ async def leaf_nudge_node(state: CoderState, **kwargs):
 
 MAX_TECH_LEAD_TEXT_ONLY = 3
 
+
 def leaf_router(state: CoderState):
     """
     Routes Tech Lead decisions to Junior, Tools, or Finish.
-    PATCHED v2: Detects text-embedded tool calls from malformed LLM output.
     Some models (Gemini) emit tool calls as text like "call:delegate_task{plan:...}"
     instead of structured tool_calls. We detect and route these correctly.
     """
     last_msg = state["messages"][-1]
     
-    # Tool calls: route normally and reset text_only counter
+    # Tool calls: Precedence ladder (no looping)
     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-        for tc in last_msg.tool_calls:
-            if tc["name"] == "delegate_task":
-                return "junior_dev"
-            elif tc["name"] == "finish_task":
-                return "leaf_finish"
-            elif tc["name"] == "update_scratchpad":
-                return "leaf_tools"
-        return "leaf_tools"
+        # Extract all requested tool names into a list
+        tool_names = [tc["name"] for tc in last_msg.tool_calls]
+        
+        # Priority 1: Delegate task (takes precedence over everything)
+        if "delegate_task" in tool_names:
+            return "junior_dev"
+        
+        # Priority 2: Finish task (takes precedence over scratchpad)
+        elif "finish_task" in tool_names:
+            return "leaf_finish"
+        
+        # Priority 3: Update scratchpad or any other tools
+        else:
+            return "leaf_tools"
     
-    # PATCHED v2: Detect text-embedded tool calls (malformed LLM output)
-    # Some models output "call:delegate_task{plan:" or "delegate_task(" as text
+    # Fallback logic for text-embedded tool calls
     msg_content = ""
     if hasattr(last_msg, "content") and last_msg.content:
         msg_content = str(last_msg.content) if not isinstance(last_msg.content, str) else last_msg.content
@@ -1113,38 +1119,42 @@ def leaf_router(state: CoderState):
     log_terminal(f"[LEAF-ROUTER] Tech Lead text-only response ({text_only_count + 1}/{MAX_TECH_LEAD_TEXT_ONLY}) — nudging")
     return "leaf_nudge"
 
+
+
 def main_router(state: MainState):
     """
-    The Smart Router (Interceptor Pattern).
-    Distinguishes between 'doing work' (File I/O) and 'managing people' (Deploying Agents).
+    The Smart Router (Post-Execution Pattern).
+    Evaluates what tools the Architect called AFTER they have run.
     """
     messages = state["messages"]
-    last_message = messages[-1]
     
-    # 1. Check for Tool Calls
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        # We iterate through calls to see if a CONTROL tool was used
-        for tool_call in last_message.tool_calls:
-            name = tool_call["name"]
+    # 1. Find the last AI message that initiated the tool calls
+    # We search backwards because the very last messages are now ToolMessages from main_tools_node
+    last_ai_msg = None
+    for msg in reversed(messages):
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            last_ai_msg = msg
+            break
             
-            if name == "deploy_coder":
-                return "enter_leaf"
-            
-            if name == "deploy_integrator":
-                return "enter_integrator"
-            
-            if name == "deploy_specialist":
-                return "enter_expert"
-                
-        # If no control tool was found, but other tools exist (like read_file),
-        # route to the generic tool executor.
-        return "main_tools"
+    # Fallback: No tool calls found in recent history
+    if not last_ai_msg:
+        last_msg = messages[-1]
+        if hasattr(last_msg, "content") and "FINISHED" in str(last_msg.content):
+            return "__end__"
+        return "agent"
 
-    # 2. Check for Text Termination (Fallback)
-    if "FINISHED" in last_message.content:
-        return "__end__"
+    # 2. Extract the names of all tools that were requested (and are now finished)
+    tool_names = [tc["name"] for tc in last_ai_msg.tool_calls]
     
-    # 3. Default: Return to Architect for more thinking
+    # 3. Route to sub-agents if a deployment was in the list
+    if "deploy_coder" in tool_names:
+        return "enter_leaf"
+    elif "deploy_integrator" in tool_names:
+        return "enter_integrator"
+    elif "deploy_specialist" in tool_names:
+        return "enter_expert"
+        
+    # 4. Default: Return to Architect (e.g., if they only called mark_phase_done or list_files)
     return "agent"
 
 # ============================================================================
@@ -1249,9 +1259,7 @@ async def run_leaf_wrapper(state: MainState, leaf_wf, model=None):
     # The full Tech Lead session memory is DISCARDED (ephemeral)
     final_messages = final_leaf_state.get('messages', [])
     
-    # PATCHED v4: Extract finish_task summary from tool_call args.
-    # The AIMessage.content is often just reasoning text. The actual
-    # structured summary is in finish_task(summary="...") args.
+ 
     content = ""
     if final_messages:
         raw_report = final_messages[-1]
@@ -1278,9 +1286,6 @@ async def run_leaf_wrapper(state: MainState, leaf_wf, model=None):
     if not content:
         content = "Empty response: The coding team yielded control without messages."
 
-    # PATCHED v6: Read test certificate ONLY if Junior actually ran in THIS session.
-    # Stale certificates from prior runs cause false SUCCESS when Tech Lead
-    # gets force-exited without ever delegating to Junior.
     cert_proof = None
     junior_ran_this_session = any(
         "junior success report" in str(getattr(m, 'content', '')).lower()
@@ -1943,18 +1948,34 @@ async def run_factory():
             workflow.set_entry_point("agent")
             #workflow.set_entry_point("specialist")
             
-            workflow.add_conditional_edges("agent", main_router, {
-                "agent": "agent",  # Add this line!
-                "enter_leaf": "coding_specialist", 
-                "enter_expert": "specialist",
-                "enter_integrator": "integrator", 
+# 1. Simple check to see if the Architect called tools or is done
+            def agent_to_tools_router(state: MainState):
+                last_msg = state["messages"][-1]
+                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                    return "main_tools"
+                if "FINISHED" in str(getattr(last_msg, "content", "")):
+                    return "__end__"
+                return "agent" # Loops back to Architect if they need a text-only nudge
+
+            # 2. Architect goes to Tools
+            workflow.add_conditional_edges("agent", agent_to_tools_router, {
                 "main_tools": "main_tools",
+                "__end__": END,
+                "agent": "agent"
+            })
+            
+            # 3. Tools go to the Router we built in Step 3
+            workflow.add_conditional_edges("main_tools", main_router, {
+                "enter_leaf": "coding_specialist", 
+                "enter_integrator": "integrator",
+                "enter_expert": "specialist",
+                "agent": "agent",
                 "__end__": END
             })
             
+            # 4. Sub-agents always return control to the Architect when finished
             workflow.add_edge("coding_specialist", "agent")
             workflow.add_edge("integrator", "agent")
-            workflow.add_edge("main_tools", "agent")
             workflow.add_edge("specialist", "agent")
             
             project_root = workspace_paths["project_root"]
