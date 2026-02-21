@@ -50,7 +50,7 @@ class ContractManager:
         self.plan_manager: Optional[DevelopmentPlan] = None
         self.contract_store = ContractStore(str(self.contracts_dir))
         
-            async def ensure_phase_contract(self, phase_id: str, language: str = "rust") -> bool:
+    async def ensure_phase_contract(self, phase_id: str, language: str = "rust") -> bool:
                 """
                 JIT (Just-In-Time) Trigger: Checks if a phase contract exists.
                 If not, automatically invokes the LLM to generate it before proceeding.
