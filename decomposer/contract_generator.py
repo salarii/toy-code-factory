@@ -9,7 +9,7 @@ import json
 import asyncio
 from typing import Dict, List, Any, Optional
 from datetime import datetime
-from langchain_google_genai import ChatGoogleGenerativeAI
+# Use model_resolver instead of direct provider imports
 from langchain_core.messages import HumanMessage, SystemMessage
 import os
 from model_resolver import get_model, ModelRole
@@ -157,8 +157,7 @@ CRITICAL: Return ONLY valid JSON, no markdown, no explanation.
 async def generate_phase_contract(
     phase: Dict[str, Any],
     language: str,
-    model_name: str = "gemini-2.5-flash",
-    temperature: float = 0.0
+    temperature: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Generate detailed contract for a development phase.
@@ -179,7 +178,7 @@ async def generate_phase_contract(
     template_context = template_context or ""
     print(f"[ContractGen] Generating contract for phase: {phase['phase_id']}")
     
-    model = get_model(ModelRole.DECOMPOSER)
+    model = get_model(ModelRole.CONTRACT_GENERATOR, temperature=temperature)
     
     # Generate contract for each task in phase
     contracts = []
@@ -216,12 +215,6 @@ async def generate_phase_contract(
         try:
             contract = json.loads(response_text)
             contract["generated_at"] = datetime.utcnow().isoformat() + "Z"
-            
-            # Add phase completion tracking fields
-            contract["phase_done"] = False
-            contract["phase_done_by"] = None
-            contract["phase_done_at"] = None
-            contract["reopen_history"] = []
 
             # Ensure contract has required keys for validation
             if "contract_id" not in contract:
@@ -241,11 +234,7 @@ async def generate_phase_contract(
         "phase_name": phase["phase_name"],
         "contracts": contracts,
         "templates_used": bool(template_context),
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-        "phase_done": False,
-        "phase_done_by": None,
-        "phase_done_at": None,
-        "reopen_history": []
+        "generated_at": datetime.utcnow().isoformat() + "Z"
     }
     
     return phase_contract
@@ -302,19 +291,11 @@ def validate_contract_completeness(contract: Dict[str, Any]) -> List[str]:
     errors = []
     
     # Check required top-level keys
-    required_keys = ["contract_id", "module_spec", "test_specifications", "acceptance_criteria", 
-                    "phase_done", "phase_done_by", "phase_done_at", "reopen_history"]
+    required_keys = ["contract_id", "module_spec", "test_specifications", "acceptance_criteria"]
      
     for key in required_keys:
         if key not in contract:
             errors.append(f"Missing required key: {key}")
-    
-    # Validate phase completion field types
-    if "phase_done" in contract and not isinstance(contract["phase_done"], bool):
-        errors.append("phase_done must be boolean")
-    
-    if "reopen_history" in contract and not isinstance(contract["reopen_history"], list):
-        errors.append("reopen_history must be list")
 
     # Validate module spec
     if "module_spec" in contract:

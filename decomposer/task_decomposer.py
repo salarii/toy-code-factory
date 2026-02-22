@@ -1,7 +1,7 @@
 """
 Task Decomposer - Converts natural language task.json into structured dev_plan.json
 
-This module uses LLMs to break down high-level project descriptions into
+This module uses standardized LLM interfaces to break down project descriptions into
 granular, phase-based development plans with precise function signatures
 and test specifications.
 """
@@ -11,7 +11,8 @@ import json
 import asyncio
 from datetime import datetime
 from typing import Optional, Dict, List, Any
-from langchain_google_genai import ChatGoogleGenerativeAI
+# Logic now handled via model_resolver
+# Removed direct provider import
 from langchain_core.messages import HumanMessage, SystemMessage
 import sys
 from model_resolver import get_model, ModelRole
@@ -131,16 +132,14 @@ Begin decomposition now.
 
 async def decompose_task(
     task_json_path: str,
-    model_name: str = "gemini-2.5-pro",
     output_path: str = "dev_plan.json",
-    temperature: float = 0.1
+    temperature: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Main entry point: Converts natural language task.json into structured dev_plan.json
     
     Args:
         task_json_path: Path to input task specification
-        model_name: LLM model for decomposition (default: gemini-2.5-pro for reasoning)
         output_path: Where to save generated plan
         temperature: Model temperature (low for consistency)
         
@@ -178,8 +177,8 @@ async def decompose_task(
             raise ValueError(f"Task specification missing required field: {field}")
     
     # Initialize LLM
-    print(f"[Decomposer] Initializing {model_name}...")
-    model = get_model(ModelRole.DECOMPOSER)
+    print(f"[Decomposer] Initializing model for DECOMPOSER role...")
+    model = get_model(ModelRole.DECOMPOSER, temperature=temperature)
     
     # Prepare decomposition prompt
     prompt_content = DECOMPOSITION_PROMPT.format(
@@ -222,7 +221,7 @@ async def decompose_task(
     
     # Add metadata
     dev_plan["metadata"]["generated_at"] = datetime.utcnow().isoformat() + "Z"
-    dev_plan["metadata"]["model_used"] = model_name
+    dev_plan["metadata"]["model_used"] = getattr(model, "model", "unknown-model")
     
     # Validate plan structure
     _validate_plan(dev_plan)

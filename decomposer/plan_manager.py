@@ -74,6 +74,7 @@ class DevelopmentPlan:
                 f"progress={self.progress['mission_id']}"
             )
     
+
     def get_current_phase(self) -> Optional[Dict[str, Any]]:
         """
         Returns the lowest phase where phase_done == false.
@@ -82,35 +83,19 @@ class DevelopmentPlan:
         Returns:
             Phase dictionary or None if all phases complete
         """
-        # Scan all contract files to find lowest phase with phase_done == false
-        undone_phases = []
-        
         for phase in self.plan["phases"]:
             phase_id = phase["phase_id"]
             
-            # Try to load contract file
-            contract_path = self.contracts_dir / f"phase_{phase_id}.json"
-            if not contract_path.exists():
-                # No contract yet, phase not started
-                undone_phases.append(phase)
-                continue
+            is_in_completed_list = phase_id in self.progress.get("phases_completed", [])
+            is_marked_completed = self.progress.get("phase_status", {}).get(phase_id) == "completed"
             
-            with open(contract_path, 'r') as f:
-                contract = json.load(f)
-            
-            # Check phase_done flag
-            if not contract.get("phase_done", False):
-                undone_phases.append(phase)
-        
-        if not undone_phases:
-            print("[PlanManager] All phases completed!")
-            return None
-        
-        # Return lowest phase
-        lowest_phase = undone_phases[0]
-        print(f"[PlanManager] Current phase: {lowest_phase['phase_id']} - {lowest_phase['phase_name']}")
-        return lowest_phase
-    
+            if not (is_in_completed_list or is_marked_completed):
+                print(f"[PlanManager] Current phase: {phase_id} - {phase['phase_name']}")
+                return phase
+                
+        print("[PlanManager] All phases completed!")
+        return None
+
     def architect_mark_phase_done(
         self, 
         phase_id: str, 
@@ -143,26 +128,12 @@ class DevelopmentPlan:
         if not contract_path.exists():
             raise FileNotFoundError(f"Contract file not found: {contract_path}")
         
-        with open(contract_path, 'r') as f:
-            contract = json.load(f)
-        
         # Check if already done
-        if contract.get("phase_done", False):
-            raise ValueError(
-                f"Phase {phase_id} is already marked done at {contract['phase_done_at']}. "
-                f"Use architect_reopen_phase() to reopen it first."
-            )
+        if phase_id in self.progress.get("phases_completed", []):
+            raise ValueError(f"Phase {phase_id} is already marked done. Use architect_reopen_phase() to reopen it first.")
         
         # Mark complete
         completed_at = datetime.utcnow().isoformat() + "Z"
-        
-        # Update contract file
-        contract["phase_done"] = True
-        contract["phase_done_by"] = actor
-        contract["phase_done_at"] = completed_at
-        
-        with open(contract_path, 'w') as f:
-            json.dump(contract, f, indent=2)
         
         # Update progress tracker (derived from contracts)
         self.progress["phases_completed"].append(phase_id)
@@ -238,12 +209,9 @@ class DevelopmentPlan:
         if not contract_path.exists():
             raise FileNotFoundError(f"Contract file not found: {contract_path}")
         
-        with open(contract_path, 'r') as f:
-            contract = json.load(f)
-        
         # Check if currently done
-        if not contract.get("phase_done", False):
-            raise ValueError(f"Phase {phase_id} is not marked done (phase_done=False). Cannot reopen a phase that isn't closed.")
+        if phase_id not in self.progress.get("phases_completed", []):
+            raise ValueError(f"Phase {phase_id} is not marked done. Cannot reopen a phase that isn't closed.")
         
         # Create reopen event
         reopened_at = datetime.utcnow().isoformat() + "Z"
@@ -252,19 +220,15 @@ class DevelopmentPlan:
             "reopened_by": actor,
             "reason": reason,
             "requested_by": requested_by,
-            "previous_done_at": contract.get("phase_done_at")
+            "phase_id": phase_id
         }
         
-        # Update contract file
-        contract["phase_done"] = False
-        contract["phase_done_by"] = None
-        contract["phase_done_at"] = None
-        if "reopen_history" not in contract:
-            contract["reopen_history"] = []
-        contract["reopen_history"].append(reopen_event)
-        
-        with open(contract_path, 'w') as f:
-            json.dump(contract, f, indent=2)
+        if "reopen_history" not in self.progress:
+            self.progress["reopen_history"] = {}
+        if phase_id not in self.progress["reopen_history"]:
+            self.progress["reopen_history"][phase_id] = []
+            
+        self.progress["reopen_history"][phase_id].append(reopen_event)
         
         # Update progress tracker
         if phase_id in self.progress["phases_completed"]:
@@ -312,18 +276,22 @@ class DevelopmentPlan:
         Raises:
             FileNotFoundError: If phase contract doesn't exist
         """
-        contract_path = self.contracts_dir / f"phase_{phase_id}.json"
-        if not contract_path.exists():
-            raise FileNotFoundError(f"Contract file not found: {contract_path}")
+        is_done = phase_id in self.progress.get("phases_completed", [])
         
-        with open(contract_path, 'r') as f:
-            contract = json.load(f)
-        
+        done_by = None
+        done_at = None
+        if is_done:
+            for event in reversed(self.progress.get("phase_history", [])):
+                if event["phase_id"] == phase_id and "marked_by" in event:
+                    done_by = event["marked_by"]
+                    done_at = event["completed_at"]
+                    break
+                    
         return {
-            "phase_done": contract.get("phase_done", False),
-            "phase_done_by": contract.get("phase_done_by"),
-            "phase_done_at": contract.get("phase_done_at"),
-            "reopen_count": len(contract.get("reopen_history", []))
+            "phase_done": is_done,
+            "phase_done_by": done_by,
+            "phase_done_at": done_at,
+            "reopen_count": len(self.progress.get("reopen_history", {}).get(phase_id, []))
         }
     
     def consume_phase(self, phase_id: str) -> Optional[Dict[str, Any]]:
@@ -433,12 +401,8 @@ class DevelopmentPlan:
         has_reopens = False
         for phase in self.plan["phases"]:
             phase_id = phase["phase_id"]
-            contract_path = self.contracts_dir / f"phase_{phase_id}.json"
-            if contract_path.exists():
-                with open(contract_path, 'r') as f:
-                    contract = json.load(f)
-                reopen_history = contract.get("reopen_history", [])
-                if reopen_history:
+            reopen_history = self.progress.get("reopen_history", {}).get(phase_id, [])
+            if reopen_history:
                     has_reopens = True
                     print(f" {phase_id}: {phase['phase_name']}")
                     for event in reopen_history:

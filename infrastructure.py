@@ -420,3 +420,37 @@ if __name__ == "__main__":
    import logging
    import sys
    mcp.run(transport="stdio") # Ensure transport is explicit
+
+@mcp.tool()
+def test_jit_trigger(workspace_path: str, next_phase_id: str) -> str:
+    """
+    Test Tool: Forcefully tests the lazy generation of a specific phase.
+    Use this to manually trigger the JIT contract builder for the next phase.
+    """
+    import asyncio
+    from contract_integration import ContractManager
+    
+    try:
+        manager = ContractManager(workspace_path)
+        # Run the async JIT method synchronously for the tool
+        success = asyncio.run(manager.ensure_phase_contract(next_phase_id))
+        
+        contract_file = manager.contracts_dir / f"phase_{next_phase_id}.json"
+        if success and contract_file.exists():
+            return f"✅ JIT Lazy trigger succeeded. Contract created at .factory/contracts/phase_{next_phase_id}.json"
+        else:
+            return f"❌ JIT Trigger failed. Contract not found."
+    except Exception as e:
+        return f"❌ Error during JIT trigger test: {str(e)}"
+
+@mcp.tool()
+def debug_factory_state(workspace_path: str) -> str:
+    """Reads the current state of the .factory/ tracking directory."""
+    import os
+    factory_dir = os.path.join(workspace_path, ".factory")
+    if not os.path.exists(factory_dir):
+        return "❌ .factory directory does not exist yet."
+    
+    contracts_path = os.path.join(factory_dir, "contracts")
+    contracts = os.listdir(contracts_path) if os.path.exists(contracts_path) else []
+    return f"Factory Tracking Directory exists.\nGenerated Contracts: {contracts}"

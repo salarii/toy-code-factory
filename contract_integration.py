@@ -105,9 +105,7 @@ class ContractManager:
         
         plan = await decompose_task(
             task_json_path=task_json_path,
-            model_name="gemini-2.5-pro",
-            output_path=str(self.dev_plan_path),
-            temperature=0.0
+            output_path=str(self.dev_plan_path)
         )
         
         print(f"[ContractMgr] ✓ dev_plan.json generated at {self.dev_plan_path}")
@@ -167,9 +165,7 @@ class ContractManager:
         template_context, _ = load_templates(templates_dir, verbose=False)
         contract = await generate_phase_contract(
             phase=phase,
-            language=language,
-            model_name="gemini-2.5-flash",
-            temperature=0.0
+            language=language
         )
         
         # Validate each task contract within the phase contract
@@ -222,7 +218,6 @@ class ContractManager:
             "contract_path": str(contract_path)
         }
     
-
 
     def get_phase_status(self, phase_id: str) -> str:
         """Get current status of a phase."""
@@ -397,7 +392,6 @@ human/LLM-readable implementation specification block.
 
 from typing import Dict, Any, Optional
 
-
 def format_phase_as_implementation_guide(phase_info: Dict[str, Any]) -> str:
     """
     Takes the dictionary returned by ContractManager.get_current_phase_info()
@@ -415,6 +409,8 @@ def format_phase_as_implementation_guide(phase_info: Dict[str, Any]) -> str:
     """
     phase = phase_info.get("phase", {})
     contract = phase_info.get("contract")
+    # FIX: Extract contract_path from the dictionary with a fallback
+    contract_path = phase_info.get("contract_path", "Unknown path")
     
     if contract is None:
         return (
@@ -424,8 +420,6 @@ def format_phase_as_implementation_guide(phase_info: Dict[str, Any]) -> str:
         )
 
     return _format_contract(contract)
-
-
 
 
 # ---------------------------------------------------------------------------

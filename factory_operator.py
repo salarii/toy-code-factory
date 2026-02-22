@@ -187,7 +187,21 @@ def mark_phase_done(phase_id: str):
     global _CONTRACT_MANAGER
     
     if _CONTRACT_MANAGER is None:
-        return "ERROR: Contract manager not initialized"
+        
+    # --- JIT NEXT PHASE TRIGGER ---
+    if not generate_all_flag:  # Lazy evaluation path
+        try:
+            plan_data = _CONTRACT_MANAGER.plan_manager.plan
+            current_idx = next((i for i, p in enumerate(plan_data.get("phases", [])) if p.get("phase_id") == current_phase_id), -1)
+            if current_idx != -1 and current_idx + 1 < len(plan_data.get("phases", [])):
+                next_phase_id = plan_data["phases"][current_idx + 1]["phase_id"]
+                print(f"[Factory Operator] ⚙️ Phase completed. Triggering lazy JIT generation for next phase: {next_phase_id}")
+                asyncio.create_task(_CONTRACT_MANAGER.ensure_phase_contract(next_phase_id))
+        except Exception as e:
+            print(f"⚠ Failed to auto-trigger next phase JIT: {e}")
+    # ------------------------------
+
+    return "ERROR: Contract manager not initialized"
     
     try:
         _CONTRACT_MANAGER.update_phase_status(phase_id, "done")
@@ -1948,7 +1962,7 @@ async def run_factory():
             workflow.set_entry_point("agent")
             #workflow.set_entry_point("specialist")
             
-# 1. Simple check to see if the Architect called tools or is done
+            # 1. Simple check to see if the Architect called tools or is done
             def agent_to_tools_router(state: MainState):
                 last_msg = state["messages"][-1]
                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:

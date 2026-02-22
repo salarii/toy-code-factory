@@ -1,11 +1,12 @@
 """
-Model Resolver - Centralized Gemini model configuration and loading
+Model Resolver - Centralized LLM configuration and loading
 """
 
 import os
 from pathlib import Path
 from enum import Enum
 from typing import Optional, Dict
+# Provider-agnostic import
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
@@ -96,17 +97,17 @@ class ModelResolver:
     def _use_defaults(self):
         """Fallback defaults"""
         self._model_map = {
-            "smart": "gemini-2.5-pro",
-            "better": "gemini-2.5-pro",
-            "worker": "gemini-2.5-flash",
-            "dumb": "gemini-2.5-flash",
-            "architect": "gemini-2.5-pro",
-            "specialist": "gemini-2.5-pro",
-            "tech_lead": "gemini-2.5-pro",
-            "integrator": "gemini-2.5-flash",
-            "junior_dev": "gemini-2.5-flash",
-            "decomposer": "gemini-2.5-pro",
-            "contract_generator": "gemini-2.5-flash",
+            "smart": "LLM-2.5-pro",
+            "better": "LLM-2.5-pro",
+            "worker": "LLM-2.5-flash",
+            "dumb": "LLM-2.5-flash",
+            "architect": "LLM-2.5-pro",
+            "specialist": "LLM-2.5-pro",
+            "tech_lead": "LLM-2.5-pro",
+            "integrator": "LLM-2.5-flash",
+            "junior_dev": "LLM-2.5-flash",
+            "decomposer": "LLM-2.5-pro",
+            "contract_generator": "LLM-2.5-flash",
         }
         self._temperature_map = {"smart": 0.0, "worker": 0.0, "decomposer": 0.1}
     
@@ -115,7 +116,8 @@ class ModelResolver:
         role = role.lower().replace("-", "_")
         if role in self._model_map:
             return self._model_map[role]
-        return self._model_map.get("smart", "gemini-2.5-pro")
+        # Fallback to a system default if not mapped
+        return self._model_map.get("smart", os.getenv("DEFAULT_MODEL_NAME", "default-model"))
     
     def get_default_temperature(self, role: str) -> float:
         """Get default temperature for role"""
