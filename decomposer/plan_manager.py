@@ -52,18 +52,52 @@ class DevelopmentPlan:
         self._validate_consistency()
     
     def _initialize_progress(self) -> Dict[str, Any]:
-        """Create new progress tracking structure"""
+        """Create new progress tracking structure.
+        
+        phase_status is the SINGLE source of truth for phase completion.
+        Derived views (completed list, remaining list, percentage) are
+        computed on-the-fly via helper properties — not stored.
+        """
         return {
             "mission_id": self.plan["mission_id"],
             "started_at": datetime.utcnow().isoformat() + "Z",
             "last_updated": datetime.utcnow().isoformat() + "Z",
-            "phases_completed": [],
-            "current_phase_id": None,
-            "phases_remaining": [p["phase_id"] for p in self.plan["phases"]],
-            "completion_percentage": 0.0,
             "phase_history": [],
             "phase_status": {p["phase_id"]: p.get("status", "") for p in self.plan["phases"]}
         }
+
+    # ------------------------------------------------------------------
+    # Derived properties (computed from phase_status, never stored)
+    # ------------------------------------------------------------------
+
+    @property
+    def phases_completed(self) -> List[str]:
+        """Phase IDs with status 'completed' — derived from phase_status."""
+        return [pid for pid, st in self.progress.get("phase_status", {}).items()
+                if st == "completed"]
+
+    @property
+    def phases_remaining(self) -> List[str]:
+        """Phase IDs not yet completed — derived from phase_status."""
+        return [pid for pid, st in self.progress.get("phase_status", {}).items()
+                if st != "completed"]
+
+    @property
+    def completion_percentage(self) -> float:
+        """Percentage complete — derived from phase_status."""
+        total = len(self.plan.get("phases", []))
+        if total == 0:
+            return 0.0
+        return (len(self.phases_completed) / total) * 100
+
+    @property
+    def current_phase_id(self) -> Optional[str]:
+        """ID of first non-completed phase in plan order, or None."""
+        for phase in self.plan.get("phases", []):
+            pid = phase["phase_id"]
+            if self.progress.get("phase_status", {}).get(pid) != "completed":
+                return pid
+        return None
     
     def _validate_consistency(self):
         """Ensure progress file matches plan file"""
@@ -77,19 +111,15 @@ class DevelopmentPlan:
 
     def get_current_phase(self) -> Optional[Dict[str, Any]]:
         """
-        Returns the lowest phase where phase_done == false.
-        Reads directly from contract files (single source of truth).
+        Returns the first phase not marked 'completed' in phase_status.
+        phase_status is the single source of truth.
         
         Returns:
             Phase dictionary or None if all phases complete
         """
         for phase in self.plan["phases"]:
             phase_id = phase["phase_id"]
-            
-            is_in_completed_list = phase_id in self.progress.get("phases_completed", [])
-            is_marked_completed = self.progress.get("phase_status", {}).get(phase_id) == "completed"
-            
-            if not (is_in_completed_list or is_marked_completed):
+            if self.progress.get("phase_status", {}).get(phase_id) != "completed":
                 print(f"[PlanManager] Current phase: {phase_id} - {phase['phase_name']}")
                 return phase
                 
@@ -128,45 +158,34 @@ class DevelopmentPlan:
         if not contract_path.exists():
             raise FileNotFoundError(f"Contract file not found: {contract_path}")
         
-        # Check if already done
-        if phase_id in self.progress.get("phases_completed", []):
+        # Check if already done (phase_status is single source of truth)
+        if self.progress.get("phase_status", {}).get(phase_id) == "completed":
             raise ValueError(f"Phase {phase_id} is already marked done. Use architect_reopen_phase() to reopen it first.")
         
         # Mark complete
         completed_at = datetime.utcnow().isoformat() + "Z"
         
-        # Update progress tracker (derived from contracts)
-        self.progress["phases_completed"].append(phase_id)
-        if phase_id in self.progress["phases_remaining"]:
-            self.progress["phases_remaining"].remove(phase_id)
-        self.progress["last_updated"] = completed_at
-        
-        # Update phase status to "completed"
+        # Update phase_status (single source of truth)
         if "phase_status" not in self.progress:
             self.progress["phase_status"] = {}
         self.progress["phase_status"][phase_id] = "completed"
+        self.progress["last_updated"] = completed_at
 
-        # Add to history
+        # Add to history (audit trail)
         self.progress["phase_history"].append({
             "phase_id": phase_id,
             "completed_at": completed_at,
             "marked_by": actor
         })
         
-        # Update completion percentage
-        total_phases = len(self.plan["phases"])
-        completed_count = len(self.progress["phases_completed"])
-        self.progress["completion_percentage"] = (completed_count / total_phases) * 100
-        
-        # Update current phase
+        # Get next phase (derived from phase_status)
         next_phase = self.get_current_phase()
-        self.progress["current_phase_id"] = next_phase["phase_id"] if next_phase else None
         
         # Save progress
         self.save_progress()
         
         print(f"[PlanManager] ✓ Phase {phase_id} marked done by {actor} at {completed_at}")
-        print(f"[PlanManager] Progress: {self.progress['completion_percentage']:.1f}%")
+        print(f"[PlanManager] Progress: {self.completion_percentage:.1f}%")
         
         return next_phase
     
@@ -230,25 +249,11 @@ class DevelopmentPlan:
             
         self.progress["reopen_history"][phase_id].append(reopen_event)
         
-        # Update progress tracker
-        if phase_id in self.progress["phases_completed"]:
-            self.progress["phases_completed"].remove(phase_id)
-        if phase_id not in self.progress["phases_remaining"]:
-            # Insert at correct position (sorted by phase number)
-            self.progress["phases_remaining"].append(phase_id)
-            self.progress["phases_remaining"].sort()
-        
-        self.progress["last_updated"] = reopened_at
-        
-        # Update phase status
+        # Update phase_status (single source of truth)
         if "phase_status" not in self.progress:
             self.progress["phase_status"] = {}
         self.progress["phase_status"][phase_id] = "reopened"
-        
-        # Recalculate completion percentage
-        total_phases = len(self.plan["phases"])
-        completed_count = len(self.progress["phases_completed"])
-        self.progress["completion_percentage"] = (completed_count / total_phases) * 100
+        self.progress["last_updated"] = reopened_at
         
         # Save progress
         self.save_progress()
@@ -276,7 +281,7 @@ class DevelopmentPlan:
         Raises:
             FileNotFoundError: If phase contract doesn't exist
         """
-        is_done = phase_id in self.progress.get("phases_completed", [])
+        is_done = self.progress.get("phase_status", {}).get(phase_id) == "completed"
         
         done_by = None
         done_at = None
@@ -417,10 +422,10 @@ class DevelopmentPlan:
         """Get summary dict for status display"""
         return {
             "mission_id": self.plan["mission_id"],
-            "completion_percentage": self.progress["completion_percentage"],
-            "completed_phases": len(self.progress["phases_completed"]),
+            "completion_percentage": self.completion_percentage,
+            "completed_phases": len(self.phases_completed),
             "total_phases": len(self.plan["phases"]),
-            "current_phase": self.progress["current_phase_id"],
+            "current_phase": self.current_phase_id,
             "started_at": self.progress["started_at"],
             "last_updated": self.progress["last_updated"]
         }

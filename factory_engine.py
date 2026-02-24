@@ -8,8 +8,7 @@ import operator
 import sys
 from pathlib import Path
 from typing import Annotated, TypedDict, Literal, Optional, Dict, Any
-from langchain_core.messages import BaseMessage, SystemMessage
-from langchain_core.messages import BaseMessage, SystemMessage, AIMessage
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, HumanMessage
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LOGGING SYSTEM - TWO PATH ARCHITECTURE
@@ -340,6 +339,7 @@ class CoderState(TypedDict):
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def compress_session_ucp(
+    general_goal: str,    
     messages: list,
     action_type: str,
     affected_files: list,
@@ -388,7 +388,7 @@ async def compress_session_ucp(
         Compressed summary text.
     """
     from langchain_core.messages import SystemMessage as _SM, HumanMessage as _HM
-
+    messages.insert(0, general_goal)  
     recent = messages[-recent_count:] if len(messages) > recent_count else messages
     log_text = "\n".join([
         f"{msg.__class__.__name__}: {str(msg.content)[:content_truncate] if hasattr(msg, 'content') else str(msg)[:content_truncate]}"
@@ -580,7 +580,7 @@ def render_persona_prompt(persona_config: dict, role_name: str, context: dict) -
     return template_str
 
 
-async def safe_model_call(messages, model, agent_name, agent_id=None, personas_config=None):
+async def safe_model_call(human_input, fixed_message, messages, model, agent_name, agent_id=None, personas_config=None):
     """
     Centralized model call with TWO-PATH logging:
     - Terminal: Minimal progress indicators
@@ -597,7 +597,10 @@ async def safe_model_call(messages, model, agent_name, agent_id=None, personas_c
     
     # PATH 1: TERMINAL - Minimal progress indicator
     log_terminal(f"[{transaction_id}] {agent_name} → Thinking...")
-    messages = [ SystemMessage(content=persona_str) ] + messages
+    messages = [ SystemMessage(content=persona_str) ] + \
+          [ SystemMessage(content=fixed_message) ] +  \
+          [HumanMessage(human_input) ]+ \
+          messages
     # PATH 2: FILE - Complete transaction log
     if INPUT_LOG_PATH:
         log_transaction_start(transaction_id, agent_name)

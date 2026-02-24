@@ -14,7 +14,7 @@ async def run_debugger():
     # 1. Setup a dummy workspace for the debugger
     workspace_dir = "./debug_workspace"
     
-    #shutil.rmtree(workspace_dir, ignore_errors=True) # Comment this line out to persist the workspace between runs.
+    shutil.rmtree(workspace_dir, ignore_errors=True) # Comment this line out to persist the workspace between runs.
 
     os.makedirs(workspace_dir, exist_ok=True)
     
@@ -54,7 +54,7 @@ async def run_debugger():
 
     print("\n=== STEP 3: Debugging Contract Reading & Formatting ===")
     # Place a breakpoint on the line below to step into get_current_phase_info
-    phase_info = manager.get_current_phase_info()
+    phase_info = await manager.get_current_phase_info()
     
     if phase_info:
         # Place a breakpoint on the line below to step into the formatter
@@ -68,7 +68,7 @@ async def run_debugger():
     # 4a. Mark P001 as finished
     manager.update_phase_status("P001", "completed")
     print(f"Status of P001 after marking finished: {manager.get_phase_status('P001')}")
-    
+    phase  = await manager.get_current_phase_info()
     # 4b. Mark P001 as unfinished (rolling back)
     manager.update_phase_status("P001", "pending")
     print(f"Status of P001 after marking unfinished: {manager.get_phase_status('P001')}")
@@ -80,7 +80,7 @@ async def run_debugger():
     print("\n=== STEP 5: Triggering Next Phase Generation ===")
     # Because P001 is now "completed", get_current_phase_info() should automatically 
     # resolve to the next incomplete phase (e.g., P002) based on your dev_plan.json.
-    next_phase_info = manager.get_current_phase_info()
+    next_phase_info = await manager.get_current_phase_info()
     
     if next_phase_info and next_phase_info.get("phase"):
         next_phase_id = next_phase_info["phase"]["phase_id"]

@@ -8,7 +8,7 @@ import json
 import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-
+import re
 # Import from decomposer modules
 import sys
 sys.path.append('/workspace/decomposer')
@@ -185,12 +185,9 @@ class ContractManager:
         print(f"[ContractMgr] ✓ Contract generated for {phase_id}")
         return contract
     
-    def get_current_phase_info(self) -> Optional[Dict[str, Any]]:
+    async def get_current_phase_info(self, language: str = "rust") -> Optional[Dict[str, Any]]:
         """
-        Gets current phase and its contract.
-        
-        Returns:
-            Dictionary with phase and contract, or None if all complete
+        Gets current phase and its contract. Generates the contract if it's missing.
         """
         plan_manager = self.get_plan_manager()
         current_phase = plan_manager.get_current_phase()
@@ -201,23 +198,29 @@ class ContractManager:
         phase_id = current_phase["phase_id"]
         contract_path = self.contracts_dir / f"phase_{phase_id}.json"
         
+        # JIT Trigger: If the contract doesn't exist, generate it now
         if not contract_path.exists():
-            print(f"[ContractMgr] WARNING: Contract missing for current phase {phase_id}")
+            print(f"[ContractMgr] Contract missing for current phase {phase_id}. Triggering generation...")
+            # You can use either ensure_phase_contract or ensure_contract_exists here
+            await self.ensure_contract_exists(phase_id, language)
+        
+        # Now it is guaranteed to exist (unless generation failed)
+        try:
+            with open(contract_path, 'r') as f:
+                contract = json.load(f)
+        except FileNotFoundError:
+            print(f"[ContractMgr] ERROR: Failed to generate or read contract for {phase_id}")
             return {
                 "phase": current_phase,
                 "contract": None,
                 "contract_path": str(contract_path)
             }
         
-        with open(contract_path, 'r') as f:
-            contract = json.load(f)
-        
         return {
             "phase": current_phase,
             "contract": contract,
             "contract_path": str(contract_path)
         }
-    
 
     def get_phase_status(self, phase_id: str) -> str:
         """Get current status of a phase."""
@@ -301,88 +304,46 @@ async def initialize_contracts_for_run(
     return manager
 
 
-def inject_contract_into_tech_lead_prompt(
-    original_prompt: str,
-    contract_xml: str
-) -> str:
-    """
-    Injects contract context into Tech Lead's system prompt.
-    
-    Args:
-        original_prompt: Original system prompt from personas.json
-        contract_xml: Contract XML block from manager
-        
-    Returns:
-        Modified system prompt with contract
-    """
-    # Insert contract before the final system_prompt summary
-    injection_point = "You are the TECHNICAL LEAD."
-    
-    if injection_point in original_prompt:
-        parts = original_prompt.split(injection_point, 1)
-        return f"{parts[0]}\n\n{contract_xml}\n\n{injection_point}{parts[1]}"
-    else:
-        # Fallback: append to end
-        return f"{original_prompt}\n\n{contract_xml}"
 
 
 def inject_architect_contract_awareness(
-    original_prompt: str,
     current_phase_id: Optional[str],
-    contract_path: Optional[str]
+    contract_path: Optional[str],
+    plan_overview: str = "",
+    progress_status: str = ""
 ) -> str:
     """
-    Injects contract awareness into Architect's system prompt.
-    
-    Args:
-        original_prompt: Original system prompt
-        current_phase_id: Current phase being worked on
-        contract_path: Path to current contract
-        
-    Returns:
-        Modified prompt
+    Injects mission status and roadmap into the Architect's system prompt.
+    Leaves persona definitions and phase implementation details out.
     """
-    if current_phase_id is None:
-        awareness = """
-<contract_system>
-STATUS: All development phases complete.
-No further contract enforcement needed.
-</contract_system>
-"""
+    # Ensure idempotency: remove previous mission status blocks to avoid infinite growth
+
+    plan_text = plan_overview if plan_overview else "No phase plan currently defined."
+    status_text = progress_status if progress_status else "No status information currently available."
+    
+    if current_phase_id:
+        phase_notice = (
+            f"CURRENT PHASE: {current_phase_id}\n"
+            f"Note: Detailed phase specifications exist at {contract_path} and have been handed over to the Tech Lead for implementation."
+        )
     else:
-        awareness = f"""
-<contract_system>
-CURRENT PHASE: {current_phase_id}
-CONTRACT LOCATION: {contract_path}
+        phase_notice = "STATUS: All development phases complete or inactive."
 
-CRITICAL RULES:
-1. Tech Lead implements according to contract - TRUST their claims of completion
-2. You delegate based on contract phases, not arbitrary breakdowns
-3. Only Specialist can override Tech Lead's contract implementation
-4. When Tech Lead reports "implemented from contract", accept unless Specialist objects
-5. Do NOT re-specify what's already in the contract
+    awareness = f"""<mission_status>
+{phase_notice}
 
-Your role: Monitor progress, delegate phases, handle escalations.
-Tech Lead's role: Implement contract functions precisely.
-PHASE MARKING:
-When subordinate reports SUCCESS with proof → call mark_phase_done(phase_id)
-Use list_phase_status() to see what you've marked done.
-These are YOUR markings - your source of truth about completion.
-</contract_system>
-"""
-    
-    injection_point = "You are the LEAD ARCHITECT."
-    
-    if injection_point in original_prompt:
-        parts = original_prompt.split(injection_point, 1)
-        return f"{parts[0]}\n\n{awareness}\n\n{injection_point}{parts[1]}"
-    else:
-        return f"{original_prompt}\n\n{awareness}"
+--- MISSION EXTENSION: PHASE-BASED PLAN ---
+The following is the detailed phase-based roadmap detailing what needs to be done:
+{plan_text}
 
+--- CURRENT EXECUTION STATUS ---
+The following information outlines what has already been accomplished:
+{status_text}
+-------------------------------------------
+</mission_status>"""
 
-    
-    
-
+    # Append cleanly to the bottom of the prompt
+    return f"\n{awareness}"
 
 """
 Contract Formatter Module
@@ -427,20 +388,23 @@ def format_phase_as_implementation_guide(phase_info: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def _format_contract(contract: Dict[str, Any]) -> str:
-    """Core formatter that builds the implementation guide text."""
+    """Core formatter that builds the phase specification text."""
     sections = []
 
+    # Injecting explicit "Phase Spec" terminology and direct agent instructions
     sections.append(
         "╔══════════════════════════════════════════════════════════════╗\n"
-        "║            IMPLEMENTATION SPECIFICATION GUIDE               ║\n"
+        "║            COMPLETE PHASE SPECIFICATION GUIDE                ║\n"
         "╚══════════════════════════════════════════════════════════════╝\n"
+        "👉 SYSTEM HINT FOR AGENT: This entire document IS the complete \n"
+        "Phase Specification. DO NOT make external tool calls to fetch it.\n"
+        "All context required for this phase is provided below.\n\n"
     )
-
 
     # ── Module Specification ────────────────────────────────────────────
     module = contract.get("module_spec", {})
     if module:
-        sections.append(_section_divider("MODULE SPECIFICATION"))
+        sections.append(_section_divider("PHASE MODULE SPECIFICATION"))
         sections.append(
             f"Module Name : {module.get('module_name', 'N/A')}\n"
             f"Purpose     : {module.get('purpose', 'N/A')}\n"
@@ -449,7 +413,7 @@ def _format_contract(contract: Dict[str, Any]) -> str:
         # ── Public Interface ────────────────────────────────────────────
         public_interface = module.get("public_interface", [])
         if public_interface:
-            sections.append(_section_divider("PUBLIC INTERFACE"))
+            sections.append(_section_divider("PHASE PUBLIC INTERFACE"))
 
             for i, item in enumerate(public_interface, 1):
                 sections.append(_format_interface_item(item, i))
@@ -457,7 +421,7 @@ def _format_contract(contract: Dict[str, Any]) -> str:
     # ── Test Specifications ─────────────────────────────────────────────
     test_specs = contract.get("test_specifications", [])
     if test_specs:
-        sections.append(_section_divider("TEST SPECIFICATIONS"))
+        sections.append(_section_divider("PHASE TEST SPECIFICATIONS"))
 
         for category_block in test_specs:
             category = category_block.get("test_category", "unknown")
@@ -472,7 +436,7 @@ def _format_contract(contract: Dict[str, Any]) -> str:
     # ── Acceptance Criteria ─────────────────────────────────────────────
     criteria = contract.get("acceptance_criteria", [])
     if criteria:
-        sections.append(_section_divider("ACCEPTANCE CRITERIA"))
+        sections.append(_section_divider("PHASE ACCEPTANCE CRITERIA"))
         for j, criterion in enumerate(criteria, 1):
             sections.append(f"  [{j}] {criterion}\n")
         sections.append("\n")
@@ -481,7 +445,7 @@ def _format_contract(contract: Dict[str, Any]) -> str:
     footer_line = "=" * 62
     sections.append(
         f"{footer_line}\n"
-        "END OF IMPLEMENTATION GUIDE\n"
+        "END OF COMPLETE PHASE SPECIFICATION\n"
         f"{footer_line}\n"
     )
 
