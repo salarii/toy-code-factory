@@ -352,6 +352,90 @@ def git_checkpoint(commit_message: str) -> str:
         return f"❌ GIT FAILED: {str(e)}"
 
 @mcp.tool()
+def git_log(max_count: int = 10) -> str:
+    """
+    Show recent git commits (oneline format).
+    Use this to review what checkpoints exist and assess progress direction.
+    """
+    if not _PROJECT_ROOT:
+        return "❌ ERROR: Workspace not initialized."
+    
+    import subprocess
+    try:
+        res = subprocess.run(
+            ["git", "log", "--oneline", f"-{max_count}"],
+            cwd=_PROJECT_ROOT,
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0:
+            return f"Recent commits (newest first):\n{res.stdout}" if res.stdout.strip() else "No commits yet."
+        return f"❌ GIT LOG ERROR:\n{res.stderr}"
+    except Exception as e:
+        return f"❌ GIT LOG FAILED: {str(e)}"
+
+@mcp.tool()
+def git_diff(commit_ref: str = "HEAD") -> str:
+    """
+    Show diff of working tree vs a commit (default HEAD).
+    Useful to see what changed since last checkpoint.
+    """
+    if not _PROJECT_ROOT:
+        return "❌ ERROR: Workspace not initialized."
+    
+    import subprocess
+    try:
+        res = subprocess.run(
+            ["git", "diff", commit_ref],
+            cwd=_PROJECT_ROOT,
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0:
+            diff_text = res.stdout.strip()
+            if not diff_text:
+                return f"No changes since {commit_ref}."
+            # Truncate large diffs
+            if len(diff_text) > 5000:
+                return f"Diff vs {commit_ref} (truncated):\n{diff_text[:5000]}\n... [truncated {len(diff_text)-5000} chars]"
+            return f"Diff vs {commit_ref}:\n{diff_text}"
+        return f"❌ GIT DIFF ERROR:\n{res.stderr}"
+    except Exception as e:
+        return f"❌ GIT DIFF FAILED: {str(e)}"
+
+@mcp.tool()
+def git_reset_to(commit_hash: str) -> str:
+    """
+    Hard-reset the working tree to a specific commit.
+    USE WITH CAUTION: This discards all changes after the target commit.
+    Intended for rolling back wrong-direction work to a known-good checkpoint.
+    """
+    if not _PROJECT_ROOT:
+        return "❌ ERROR: Workspace not initialized."
+    
+    import subprocess
+    try:
+        # First, log what we're resetting from
+        head_res = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_PROJECT_ROOT, capture_output=True, text=True
+        )
+        current = head_res.stdout.strip() if head_res.returncode == 0 else "unknown"
+        
+        res = subprocess.run(
+            ["git", "reset", "--hard", commit_hash],
+            cwd=_PROJECT_ROOT,
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0:
+            return f"✓ GIT RESET: Rolled back from {current} to {commit_hash}\n{res.stdout}"
+        return f"❌ GIT RESET ERROR:\n{res.stderr}"
+    except Exception as e:
+        return f"❌ GIT RESET FAILED: {str(e)}"
+
+
+@mcp.tool()
 def write_test_certificate(certificate_json: str) -> str:
     """
     [JUNIOR DEV ONLY] Write test certificate to PROJECT_ROOT.

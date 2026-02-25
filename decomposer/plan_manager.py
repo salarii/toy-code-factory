@@ -117,6 +117,7 @@ class DevelopmentPlan:
         Returns:
             Phase dictionary or None if all phases complete
         """
+        self._load_progress()
         for phase in self.plan["phases"]:
             phase_id = phase["phase_id"]
             if self.progress.get("phase_status", {}).get(phase_id) != "completed":

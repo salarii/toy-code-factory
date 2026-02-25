@@ -297,7 +297,9 @@ def get_tech_lead_tools(tool_schemas):
         "list_files",
         "read_file", 
         "read_file_lines",
-        "get_workspace_info"
+        "get_workspace_info",
+        "git_log",
+        "git_diff"
     ]
     
     filtered = [
@@ -330,6 +332,9 @@ def get_integrator_tools(tool_schemas):
         "edit_file_replace", 
         "run_command",
         "git_checkpoint",
+        "git_log",
+        "git_diff",
+        "git_reset_to",
         "list_files",
         "read_file",
         "read_file_lines",
@@ -429,12 +434,15 @@ async def tech_lead_node(state: CoderState, model, personas, tool_schemas):
                 f"Result: SUCCESS reported.\n"
                 f"Proof: {cert_status}\n\n"
                 f"**YOUR INSTRUCTIONS:**\n"
-                f"1. REVIEW the code changes using `read_file`.\n"
-                f"2. VERIFY the tests by reading `test_certificate.json`.\n"
-                f"3. DECIDE:\n"
-                f"   - **ACCEPT**: Call `finish_task(summary)`.\n"
+                f"1. Run `git_log` to review the commit history and verify Junior's checkpoints.\n"
+                f"2. Run `git_diff` to see what changed since the last commit.\n"
+                f"3. REVIEW the code changes using `read_file`.\n"
+                f"4. VERIFY the tests by reading `test_certificate.json`.\n"
+                f"5. DECIDE:\n"
+                f"   - **ACCEPT**: Call `finish_task(summary)` (include git hash in summary).\n"
                 f"   - **REJECT**: Call `delegate_task(instructions)` to send back to Junior.\n"
-                f"NOTE: You are now READ-ONLY. Do not edit files."
+                f"NOTE: You are now READ-ONLY. Do not edit files.\n"
+                f"GIT DISCIPLINE: If commits show wrong direction, note it in delegate_task instructions."
             ))
             messages.append(review_protocol)
             log_terminal(f"[{decision_id}] 📋 Review Protocol Activated")
@@ -442,7 +450,12 @@ async def tech_lead_node(state: CoderState, model, personas, tool_schemas):
             messages.append(HumanMessage(content=(
                 "### ⚠ JUNIOR FAILED ###\n"
                 "The Junior Developer failed to complete the task within the iteration limit.\n"
-                "Review the error log above. You must RE-PLAN and call `delegate_task` with simpler or clearer instructions."
+                "RECOVERY STEPS:\n"
+                "1. Run `git_log` to see which checkpoints exist from Junior's work.\n"
+                "2. Run `git_diff` to assess damage since last good commit.\n"
+                "3. If commits went wrong direction, include `git_reset_to <hash>` instruction in your plan.\n"
+                "4. RE-PLAN and call `delegate_task` with simpler or clearer instructions.\n"
+                "GIT DISCIPLINE: Junior MUST checkpoint after each successful build step."
            )))
 
     tech_lead_tools = get_tech_lead_tools(tool_schemas)
@@ -487,6 +500,47 @@ async def tech_lead_node(state: CoderState, model, personas, tool_schemas):
                 
                 junior_instructions = tc.get("args", {}).get("plan") or tc.get("args", {}).get("instructions") or tc.get("args", {}).get("task") or "Proceed with delegated task."
                 state_updates["junior_context"] = {**state.get("junior_context", {}), "task_description": junior_instructions}
+    
+
+            elif tc['name'] == 'finish_task':
+                log_terminal(f"[{decision_id}] 🧠 Compressing Tech Lead session before yielding to Architect...")
+                _finish_summary_arg = tc.get("args", {}).get("summary") or tc.get("args", {}).get("result") or ""
+                try:
+                    _tl_finish_compression = await compress_session_ucp(
+                        general_goal=task_description,
+                        messages=new_session_messages,
+                        action_type="finish_task",
+                        affected_files=[],
+                        model=model,
+                        role_description="a Tech Lead completing a phase and yielding to the Architect",
+                        recent_count=8,
+                        max_words=250,
+                        summary_points=[
+                            "What the phase contract required",
+                            "What files were inspected and their current state",
+                            "What Junior Dev implemented and test results",
+                            "Tech Lead's verification steps (git_log, code review, test cert)",
+                            "Final verdict and any caveats for the Architect",
+                        ],
+                    )
+                    state_updates["messages"] = [
+                        HumanMessage(content=(
+                            f"### TECH LEAD SESSION SUMMARY (finish_task) ###\n"
+                            f"{_tl_finish_compression}\n\n"
+                            f"### TECH LEAD VERDICT ###\n"
+                            f"{_finish_summary_arg}\n"
+                        )),
+                        response  # AIMessage with finish_task — router needs this as messages[-1]
+                    ]
+                    log_terminal(f"[{decision_id}] ✓ Tech Lead session compressed for Architect handoff")
+                except Exception as _comp_err:
+                    log_terminal(f"[{decision_id}] ⚠ finish_task compression failed: {_comp_err}")
+                    # Fallback: keep the raw finish summary  response so router still works
+                    state_updates["messages"] = [
+                        HumanMessage(content=f"### TECH LEAD VERDICT ###\n{_finish_summary_arg}"),
+                        response
+                    ]
+    
     else:
         _resp_text = str(response.content) if hasattr(response, 'content') else ""
         if "delegate_task" in _resp_text.lower() and ("plan" in _resp_text.lower() or "{" in _resp_text):
@@ -586,6 +640,8 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
     last_test_output = "" 
     build_passed = False  
     last_error = ""
+    compression_count = 0
+    MAX_COMPRESSIONS = 20
 
     log_split(
         f"[{decision_id}] Junior Dev Received Task", 
@@ -597,14 +653,21 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
     
     # Prepend Contextual Headers to the Task
     context_header = (
-        f"## ENVIRONMENT CONTEXT ##\n"
-        f"PROJECT_ROOT: {project_root}\n"
-        f"WORKING_DIR: {base_dir}\n"
-        f"-------------------------\n"
+     f"[SYSTEM: ENVIRONMENT — Do not modify these paths]\n"
+     f"PROJECT_ROOT: {project_root}\n"
+     f"WORKING_DIR: {base_dir}\n"
+     f"[END ENVIRONMENT]\n"
     )
     current_session_messages =[]
 
-    fixed_task = f"{context_header}\nPay attention you received task proceed to accomplish:\n{task_description}"
+    fixed_task = (
+     f"\n╔══════════════════════════════════════════════════════════════╗\n"
+     f"║  📋 TECH LEAD INSTRUCTION — READ AND EXECUTE                ║\n"
+     f"╠══════════════════════════════════════════════════════════════╣\n"
+     f"{task_description}\n"
+     f"╚══════════════════════════════════════════════════════════════╝\n"
+     f"⚡ YOU MUST implement the above. Use tools to write code and run tests.\n"
+   )
 
     while test_iteration < MAX_TEST_ITERATIONS and not build_success:
         test_iteration += 1
@@ -619,10 +682,23 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
             else:
                 cleaned_messages.append(m)
         
-        if cleaned_messages and isinstance(cleaned_messages[-1], AIMessage):
-             cleaned_messages.append(HumanMessage(content=f"Continue implementation or fix errors: {last_error}"))
 
-        response = await safe_model_call(fixed_task, cleaned_messages, model.bind_tools(junior_tools), "Junior Dev", state)
+        if cleaned_messages and isinstance(cleaned_messages[-1], AIMessage):
+             if last_error:
+                 cleaned_messages.append(HumanMessage(content=(
+                     f"[SYSTEM: BUILD FAILED — Fix required]\n"
+                     f"Error output:\n{last_error[:800]}\n"
+                     f"[END ERROR]\n"
+                     f"Fix the error above, then run the build/test again."
+                 )))
+             else:
+                 cleaned_messages.append(HumanMessage(content=(
+                     "[SYSTEM: CONTINUE]\n"
+                     "Proceed with the next step of your Tech Lead's instruction."
+                 )))
+
+
+        response = await safe_model_call(fixed_task,context_header, cleaned_messages, model.bind_tools(junior_tools), "Junior Dev", state)
         
         tool_feedback = []
         if response.tool_calls:
@@ -666,11 +742,20 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
                             
                             # Update session with compressed history
                             current_session_messages = [
-                                HumanMessage(content=f"{context_header}\nPay attention you received task proceed to accomplish:\n{task_description}"),
-                                HumanMessage(content=f"### WORK SUMMARY ###\n{compression_summary}"),
+                                HumanMessage(content=(
+                                    f"[SYSTEM: YOUR PREVIOUS PROGRESS — What you already did this session]\n"
+                                    f"{compression_summary}\n"
+                                    f"[END PREVIOUS PROGRESS]\n"
+                                    f"Continue from where you left off. Do NOT repeat completed work."
+                                )),
                                 response  # Current decision
                             ]
+                            compression_count += 1
                             log_terminal(f"[{decision_id}] ✓ Memory compressed")
+                            if compression_count >= MAX_COMPRESSIONS:
+                                log_terminal(f"[{decision_id}] 🛑 Compression cap hit ({MAX_COMPRESSIONS}) — forcing exit to Tech Lead")
+                                last_error = f"Junior exhausted {MAX_COMPRESSIONS} work cycles without passing tests. Last error: {last_error[:500]}"
+                                break
                         except Exception as compress_err:
                             log_terminal(f"[{decision_id}] ⚠ Compression failed: {compress_err}")
 
@@ -699,6 +784,15 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
                                         arguments={"certificate_json": _json5.dumps(cert_data)}
                                     )
                                     log_terminal(f"[{decision_id}] 📜 Test certificate written to filesystem")
+                                    # GIT DISCIPLINE: Auto-checkpoint on successful test
+                                    try:
+                                        _git_result = await session.call_tool(
+                                            "git_checkpoint",
+                                            arguments={"commit_message": f"✅ Tests PASS — {task_description[:80]}"}
+                                        )
+                                        log_terminal(f"[{decision_id}] 📌 Git checkpoint after successful test")
+                                    except Exception as _git_err:
+                                        log_terminal(f"[{decision_id}] ⚠ Post-test git checkpoint failed: {_git_err}")
                                 except Exception as cert_err:
                                     log_terminal(f"[{decision_id}] ⚠ Certificate write failed: {cert_err}")
                             else:
@@ -716,8 +810,10 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
         feedback_str = "\n".join(tool_feedback)
         if build_passed and not build_success:
             feedback_str += "\n\n[SYSTEM: Build compiled successfully. Now run 'cargo test' to verify correctness before reporting.]"
+            feedback_str += "\n[GIT DISCIPLINE: Build compiles — call git_checkpoint with a descriptive message before running tests.]"
         current_session_messages.extend([HumanMessage(content=f"Feedback: {feedback_str}")])
-
+        if compression_count >= MAX_COMPRESSIONS:
+            break
     # Final reporting logic
     if not build_success:
 
@@ -1031,7 +1127,7 @@ async def leaf_tools_node(state: CoderState, session: ClientSession):
     current_messages = state.get("messages", [])
     
     # PATCHED: Hard whitelist — must match get_tech_lead_tools() MCP subset
-    TECH_LEAD_ALLOWED_MCP = {"list_files", "read_file", "read_file_lines", "get_workspace_info"}
+    TECH_LEAD_ALLOWED_MCP = {"list_files", "read_file", "read_file_lines", "get_workspace_info", "git_log", "git_diff"}
     
     # CONTROL_TOOL_MAP: Tech Lead control tools execute locally
     # (mirrors main_tools_node pattern for Architect's deploy_* tools)
@@ -1360,25 +1456,16 @@ async def run_leaf_wrapper(state: MainState, leaf_wf, model=None):
         content = "Empty response: The coding team yielded control without messages."
 
     cert_proof = None
-    junior_ran_this_session = any(
-        "junior success report" in str(getattr(m, 'content', '')).lower()
-        or "junior failure report" in str(getattr(m, 'content', '')).lower()
-        for m in final_messages
-        if hasattr(m, 'content')
-    )
+    
     try:
         cert_path = os.path.join(state.get("architect_context", {}).get("project_root", ""), "test_certificate.json")
         if os.path.exists(cert_path):
-            if junior_ran_this_session:
-                with open(cert_path, 'r') as _cf:
-                    cert_data = json.loads(_cf.read())
-                if cert_data.get("status") == "PASS":
-                    cert_proof = cert_data
-                    log_terminal(f"[Leaf Wrapper] 📜 Found test certificate: PASS (Junior confirmed this session)")
-                    # Clean up certificate after reading
-                    os.remove(cert_path)
-            else:
-                log_terminal(f"[Leaf Wrapper] ⚠ Found test_certificate.json but Junior did NOT run this session — ignoring stale certificate")
+            with open(cert_path, 'r') as _cf:
+                cert_data = json.loads(_cf.read())
+            if cert_data.get("status") == "PASS":
+                cert_proof = cert_data
+                log_terminal(f"[Leaf Wrapper] 📜 Found test certificate: PASS")
+                os.remove(cert_path)
     except Exception as cert_err:
         log_terminal(f"[Leaf Wrapper] ⚠ Certificate read failed: {cert_err}")
 
@@ -2106,9 +2193,14 @@ async def run_factory():
             leaf_wf.add_node("leaf_nudge", leaf_nudge_node)
 
             def tl_to_tools_router(state: CoderState):
-                # Always route to leaf_tools first if tools were called
                 last_msg = state["messages"][-1]
                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                    tool_names = [tc["name"] for tc in last_msg.tool_calls]
+                    # finish_task → direct yield to Architect (bypass leaf_tools entirely)
+                    if "finish_task" in tool_names:
+                        log_terminal("[LEAF-ROUTER] ✓ finish_task → yielding directly to Architect")
+                        return "leaf_finish"
+                    # All other tools → execute via leaf_tools
                     return "leaf_tools"
                 if "TASK_COMPLETE" in str(getattr(last_msg, "content", "")):
                     return "leaf_finish"
