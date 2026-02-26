@@ -23,6 +23,14 @@ class DevelopmentPlan:
     - Save progress state
     """
     
+    # Canonical status for "finished" and all legacy synonyms we accept
+    DONE_STATUS = "done"
+    DONE_ALIASES = frozenset({"done", "completed"})
+
+    def _is_done(self, phase_id: str) -> bool:
+        """Return True if phase_id is marked as finished (accepts 'done' or 'completed')."""
+        return self.progress.get("phase_status", {}).get(phase_id, "") in self.DONE_ALIASES
+
     def __init__(self, plan_path: str, progress_path: Optional[str] = None):
         """
         Initialize plan manager.
@@ -73,14 +81,14 @@ class DevelopmentPlan:
     @property
     def phases_completed(self) -> List[str]:
         """Phase IDs with status 'completed' — derived from phase_status."""
-        return [pid for pid, st in self.progress.get("phase_status", {}).items()
-                if st == "completed"]
+        return [pid for pid in self.progress.get("phase_status", {})
+                if self._is_done(pid)]
 
     @property
     def phases_remaining(self) -> List[str]:
         """Phase IDs not yet completed — derived from phase_status."""
-        return [pid for pid, st in self.progress.get("phase_status", {}).items()
-                if st != "completed"]
+        return [pid for pid in self.progress.get("phase_status", {})
+                if not self._is_done(pid)]
 
     @property
     def completion_percentage(self) -> float:
@@ -95,10 +103,18 @@ class DevelopmentPlan:
         """ID of first non-completed phase in plan order, or None."""
         for phase in self.plan.get("phases", []):
             pid = phase["phase_id"]
-            if self.progress.get("phase_status", {}).get(pid) != "completed":
+            if self.progress.get("phase_status", {}).get(pid) not in self.DONE_ALIASES:
                 return pid
         return None
     
+    def _load_progress(self):
+        """Re-read progress from disk so we pick up any external changes."""
+        if self.progress_path.exists():
+            with open(self.progress_path, 'r') as f:
+                self.progress = json.load(f)
+        else:
+            self.progress = self._initialize_progress()
+
     def _validate_consistency(self):
         """Ensure progress file matches plan file"""
         if self.progress["mission_id"] != self.plan["mission_id"]:
@@ -120,7 +136,7 @@ class DevelopmentPlan:
         self._load_progress()
         for phase in self.plan["phases"]:
             phase_id = phase["phase_id"]
-            if self.progress.get("phase_status", {}).get(phase_id) != "completed":
+            if not self._is_done(phase_id):
                 print(f"[PlanManager] Current phase: {phase_id} - {phase['phase_name']}")
                 return phase
                 
@@ -160,7 +176,7 @@ class DevelopmentPlan:
             raise FileNotFoundError(f"Contract file not found: {contract_path}")
         
         # Check if already done (phase_status is single source of truth)
-        if self.progress.get("phase_status", {}).get(phase_id) == "completed":
+        if self._is_done(phase_id):
             raise ValueError(f"Phase {phase_id} is already marked done. Use architect_reopen_phase() to reopen it first.")
         
         # Mark complete
@@ -169,7 +185,7 @@ class DevelopmentPlan:
         # Update phase_status (single source of truth)
         if "phase_status" not in self.progress:
             self.progress["phase_status"] = {}
-        self.progress["phase_status"][phase_id] = "completed"
+        self.progress["phase_status"][phase_id] = self.DONE_STATUS
         self.progress["last_updated"] = completed_at
 
         # Add to history (audit trail)
@@ -229,8 +245,8 @@ class DevelopmentPlan:
         if not contract_path.exists():
             raise FileNotFoundError(f"Contract file not found: {contract_path}")
         
-        # Check if currently done
-        if phase_id not in self.progress.get("phases_completed", []):
+        # Check if currently done (phase_status is single source of truth)
+        if not self._is_done(phase_id):
             raise ValueError(f"Phase {phase_id} is not marked done. Cannot reopen a phase that isn't closed.")
         
         # Create reopen event
@@ -282,7 +298,7 @@ class DevelopmentPlan:
         Raises:
             FileNotFoundError: If phase contract doesn't exist
         """
-        is_done = self.progress.get("phase_status", {}).get(phase_id) == "completed"
+        is_done = self._is_done(phase_id)
         
         done_by = None
         done_at = None

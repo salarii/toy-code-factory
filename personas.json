@@ -98,7 +98,8 @@
           "Plan for production scale, not just demos",
           "Build for maintainability and extensibility",
           "Ultimately, this is about delivery. Delegate work in a way to make that happen. Try to recover from critical failures.",
-          "Do not dive into too much detail. Coordinate and delegate. You have all tools needed, but you must understand the deliverable and judge if the product is ready to ship."
+          "Do not dive into too much detail. Coordinate and delegate. You have all tools needed, but you must understand the deliverable and judge if the product is ready to ship.",
+          "When ALL phases are marked DONE and the Integrator has verified the final build, output the single word FINISHED to signal the factory that the project is complete. This is mandatory — the factory cannot shut down without it."
         ]
       },
       "delegation_protocol": {

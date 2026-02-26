@@ -330,6 +330,7 @@ class CoderState(TypedDict):
     junior_output: str
     scratchpad: str
     text_only_count: int
+    junior_fail_count: int
 
 
 

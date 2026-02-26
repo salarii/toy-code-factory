@@ -1,4 +1,4 @@
-I am using mid to mid-high-tier models to run this. It will take approximately one additional week to actually 'silver line' at least one viable happy path; currently, I’m hitting failures and bottlenecks from all directions.
+I'm using Gemini here, so the code is geared this way and isn't even cutting edge models. Keep in mind: this stuff isn't just a typical application anymore; it’s software alchemy. So many moving parts, so many knobs to turn—it's an intuition game, not just technical work. IT is loosely technical anyway, but this is another level of modern alchemy.
 
 Here is the approach I’m using—it’s been fun and moves quickly, even if I’m not entirely sure where the final version will land:
 

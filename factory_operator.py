@@ -414,12 +414,15 @@ async def tech_lead_node(state: CoderState, model, personas, tool_schemas):
         messages.insert(0, HumanMessage(current_notes))
         
     junior_return = state.get("junior_output")
+    junior_fail_count = state.get("junior_fail_count", 0)
+    MAX_JUNIOR_FAILURES = 3
     if junior_return:
         messages.append(junior_return)
         jr_content = str(junior_return.content).lower() if hasattr(junior_return, 'content') else str(junior_return).lower()
         is_success = "status: success" in jr_content or "junior success report" in jr_content
  
         if is_success:
+            junior_fail_count = 0  # Reset on success
             cert_status = "⚠ Certificate missing on disk."
             try:
                 import os
@@ -447,16 +450,34 @@ async def tech_lead_node(state: CoderState, model, personas, tool_schemas):
             messages.append(review_protocol)
             log_terminal(f"[{decision_id}] 📋 Review Protocol Activated")
         else:
-            messages.append(HumanMessage(content=(
-                "### ⚠ JUNIOR FAILED ###\n"
-                "The Junior Developer failed to complete the task within the iteration limit.\n"
-                "RECOVERY STEPS:\n"
-                "1. Run `git_log` to see which checkpoints exist from Junior's work.\n"
-                "2. Run `git_diff` to assess damage since last good commit.\n"
-                "3. If commits went wrong direction, include `git_reset_to <hash>` instruction in your plan.\n"
-                "4. RE-PLAN and call `delegate_task` with simpler or clearer instructions.\n"
-                "GIT DISCIPLINE: Junior MUST checkpoint after each successful build step."
-           )))
+            junior_fail_count += 1
+            log_terminal(f"[{decision_id}] ⚠ Junior failure #{junior_fail_count}/{MAX_JUNIOR_FAILURES}")
+            if junior_fail_count >= MAX_JUNIOR_FAILURES:
+                log_terminal(f"[{decision_id}] 🚨 Junior failed {junior_fail_count} times — forcing Tech Lead to yield to Architect")
+                messages.append(HumanMessage(content=(
+                    f"### 🚨 ESCALATION: JUNIOR EXHAUSTED ({junior_fail_count} consecutive failures) ###\n"
+                    f"The Junior Developer has failed {junior_fail_count} consecutive delegation attempts.\n"
+                    f"You have re-planned {junior_fail_count} times and the problem persists.\n"
+                    f"\n"
+                    f"YOU MUST NOW YIELD CONTROL TO THE ARCHITECT.\n"
+                    f"Call finish_task() with a failure summary explaining:\n"
+                    f"  1. What was attempted across all {junior_fail_count} attempts\n"
+                    f"  2. The root blocking issue Junior could not resolve\n"
+                    f"  3. Your recommendation for Specialist intervention\n"
+                    f"\n"
+                    f"DO NOT call delegate_task again. The Architect needs to deploy the Specialist.\n"
+                )))
+            else:
+                messages.append(HumanMessage(content=(
+                    f"### ⚠ JUNIOR FAILED (attempt {junior_fail_count}/{MAX_JUNIOR_FAILURES}) ###\n"
+                    "The Junior Developer failed to complete the task within the iteration limit.\n"
+                    "RECOVERY STEPS:\n"
+                    "1. Run `git_log` to see which checkpoints exist from Junior's work.\n"
+                    "2. Run `git_diff` to assess damage since last good commit.\n"
+                    "3. If commits went wrong direction, include `git_reset_to <hash>` instruction in your plan.\n"
+                    "4. RE-PLAN and call `delegate_task` with simpler or clearer instructions.\n"
+                    "GIT DISCIPLINE: Junior MUST checkpoint after each successful build step."
+               )))
 
     tech_lead_tools = get_tech_lead_tools(tool_schemas)
     response = await safe_model_call(task_description, fixed_data, messages, model.bind_tools(tech_lead_tools), "Tech Lead", state)
@@ -464,11 +485,22 @@ async def tech_lead_node(state: CoderState, model, personas, tool_schemas):
     new_session_messages = list(messages) + [response]
     
     # Pack the state so we return everything smoothly to the router
-    state_updates = {"messages": new_session_messages}
+    state_updates = {"messages": new_session_messages, "junior_fail_count": junior_fail_count, "junior_output": ""}
 
     if hasattr(response, 'tool_calls') and response.tool_calls:
         for tc in response.tool_calls:
             log_terminal(f"[{decision_id}] Action: {tc['name']}")
+            # ── HARD BLOCK: Prevent re-delegation after failure cap ──
+            if tc['name'] == 'delegate_task' and junior_fail_count >= MAX_JUNIOR_FAILURES:
+                log_terminal(f"[{decision_id}] ⛔ BLOCKED delegate_task — junior_fail_count={junior_fail_count} >= {MAX_JUNIOR_FAILURES}")
+                force_finish_msg = HumanMessage(content=(
+                    "[SYSTEM: delegate_task BLOCKED — failure cap reached]\n"
+                    f"Junior has failed {junior_fail_count} consecutive times. You cannot re-delegate.\n"
+                    "You MUST call finish_task(summary) NOW with your failure analysis.\n"
+                    "The Architect will escalate to the Specialist.\n"
+                ))
+                state_updates["messages"] = list(new_session_messages) + [force_finish_msg]
+                return state_updates
             # We track delegation data, but NO LONGER return early!
             if tc['name'] == 'delegate_task':
                 log_terminal(f"[{decision_id}] 🧠 Compressing Tech Lead memory before Junior delegation...")
@@ -642,6 +674,15 @@ async def junior_dev_node(state: CoderState, model, session: ClientSession, pers
     last_error = ""
     compression_count = 0
     MAX_COMPRESSIONS = 20
+
+    # Clean stale test certificate from previous Junior runs
+    try:
+        _stale_cert = os.path.join(project_root, "test_certificate.json")
+        if os.path.exists(_stale_cert):
+            os.remove(_stale_cert)
+            log_terminal(f"[{decision_id}] 🧹 Removed stale test certificate")
+    except Exception:
+        pass
 
     log_split(
         f"[{decision_id}] Junior Dev Received Task", 
@@ -1417,6 +1458,7 @@ async def run_leaf_wrapper(state: MainState, leaf_wf, model=None):
         "tech_lead_spec": "",
         "junior_output": "",
         "text_only_count": 0,
+        "junior_fail_count": 0,
         "temp_dir": state.get("temp_dir", ""),
         "run_dir": state.get("run_dir", ""),
     }
@@ -1496,6 +1538,10 @@ async def run_leaf_wrapper(state: MainState, leaf_wf, model=None):
             f"STATUS: FAILURE\n"
             f"PROBLEM: {parsed['content']}\n"
             f"GOAL: {parsed['goal']}\n"
+            f"\n"
+            f"⚠ RECOMMENDATION: The coding team has been unable to resolve this. "
+            f"Consider deploying the Specialist — this problem may require structural intervention.\n"
+         
         )
     else:
         # Unparseable — Tech Lead exited without structured report
@@ -1528,7 +1574,7 @@ async def run_leaf_wrapper(state: MainState, leaf_wf, model=None):
             f"PROBLEM: Tech Lead session ended without structured report.\n"
             f"SESSION WORK DONE:\n{_leaf_session_summary}\n"
             f"RAW CONTEXT (truncated): {truncated}\n"
-            f"RECOMMENDATION: Redeploy coding team with same task.\n"
+            f"RECOMMENDATION: Consider deploying the Specialist — the coding team has been unable to deliver.\n"
         )
 
     report_entry = HumanMessage(content=normalized)
@@ -1696,6 +1742,13 @@ async def run_integrator_wrapper(state: MainState, model, session: ClientSession
         f"SUMMARY: {str(raw_summary)[:800]}\n"
         f"SESSION WORK DONE:\n{_integrator_session_summary}\n"
     )
+
+    if 'SUCCESS' not in normalized_report.split('\n')[2]:
+        normalized_report += (
+            f"\n⚠ RECOMMENDATION: The Integrator could not complete integration. "
+            f"Consider deploying the Specialist — this may require structural intervention "
+            f"rather than sending the coding team again.\n"
+        )
 
     # Return ONLY summary to Architect (Integrator's session memory discarded)
     architect_messages = state.get("messages", [])
